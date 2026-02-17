@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Journal Club — JSON → Document</title>
+  <style>
+    :root{
+      --bg:#0b1220; --panel:#101a2e; --panel2:#0f1729; --text:#e9eefc; --muted:#9fb0d1;
+      --accent:#7cc9e0; --border:#223154; --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --radius:16px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: radial-gradient(1200px 700px at 20% 5%, rgba(124,201,224,.15), transparent 60%),
+                  radial-gradient(1000px 600px at 90% 0%, rgba(124,201,224,.10), transparent 55%),
+                  var(--bg);
+      color:var(--text);
+    }
+    header{
+      position:sticky; top:0; z-index:50;
+      background: rgba(11,18,32,.82);
+      backdrop-filter: blur(10px);
+      border-bottom:1px solid rgba(34,49,84,.55);
+    }
+    .wrap{max-width:1400px; margin:0 auto; padding:14px 16px;}
+    .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+    h1{font-size:16px; margin:0;}
+    .sub{font-size:12px; color:var(--muted); margin-top:2px;}
+    .pill{
+      font-size:12px; color:var(--muted);
+      padding:8px 10px; border-radius:999px;
+      border:1px solid rgba(34,49,84,.75);
+      background: rgba(16,26,46,.55);
+    }
+    .btn{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 12px; border-radius:12px;
+      border:1px solid rgba(34,49,84,.9);
+      background: linear-gradient(180deg, rgba(16,26,46,.9), rgba(15,23,41,.9));
+      color:var(--text); cursor:pointer; user-select:none;
+      box-shadow: 0 8px 18px rgba(0,0,0,.22);
+      font-size:13px;
+    }
+    .btn:hover{border-color: rgba(124,201,224,.7);}
+    .btn.primary{border-color: rgba(124,201,224,.85);}
+    .btn:active{transform: translateY(1px);}
+
+    main .wrap{padding:16px;}
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:14px;
+    }
+    @media (max-width: 1100px){ .grid{grid-template-columns:1fr;} }
+
+    .card{
+      background: linear-gradient(180deg, rgba(16,26,46,.86), rgba(15,23,41,.82));
+      border: 1px solid rgba(34,49,84,.85);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .card .hd{
+      padding:12px 14px;
+      border-bottom: 1px solid rgba(34,49,84,.65);
+      display:flex; align-items:center; justify-content:space-between; gap:12px;
+    }
+    .card .hd .h{font-weight:650; font-size:13px; letter-spacing:.2px;}
+    .card .bd{padding:14px;}
+
+    textarea{
+      width:100%;
+      min-height:560px;
+      resize:vertical;
+      background: rgba(7,12,23,.6);
+      color: var(--text);
+      border:1px solid rgba(34,49,84,.85);
+      border-radius: 12px;
+      padding:12px 12px;
+      outline:none;
+      font-size:12.8px;
+      line-height:1.35;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    textarea:focus{
+      border-color: rgba(124,201,224,.85);
+      box-shadow: 0 0 0 3px rgba(124,201,224,.12);
+    }
+
+    .hint{font-size:12px; color:var(--muted); line-height:1.4;}
+    .err{
+      margin-top:10px;
+      padding:10px 12px;
+      border-radius: 12px;
+      border:1px solid rgba(255,107,107,.55);
+      background: rgba(255,107,107,.08);
+      color: #ffd2d2;
+      font-size:12.5px;
+      white-space:pre-wrap;
+    }
+
+    /* Rendered document */
+    .doc{
+      background: rgba(7,12,23,.25);
+      border:1px solid rgba(34,49,84,.70);
+      border-radius: 14px;
+      padding: 16px 16px;
+    }
+    .doc h2{
+      margin:18px 0 8px;
+      font-size:14px;
+      letter-spacing:.2px;
+    }
+    .doc h1{
+      font-size:20px;
+      margin:0 0 8px;
+    }
+    .doc .meta{
+      color:var(--muted);
+      font-size:12px;
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px 12px;
+      margin-bottom:12px;
+    }
+    .doc p{margin:8px 0; color: rgba(233,238,252,.96); font-size:13.2px; line-height:1.5;}
+    .doc ul{margin:8px 0 8px 20px; padding:0;}
+    .doc li{margin:4px 0; font-size:13.2px; line-height:1.45;}
+    .doc .hr{height:1px; background: rgba(34,49,84,.55); margin:14px 0;}
+    .doc code{
+      background: rgba(16,26,46,.7);
+      border:1px solid rgba(34,49,84,.65);
+      padding:2px 6px;
+      border-radius: 8px;
+      font-size:12px;
+    }
+
+    @media print{
+      header, .noprint{display:none !important;}
+      body{background:#fff; color:#000;}
+      .card{box-shadow:none; border:1px solid #ddd;}
+      textarea{display:none;}
+      .doc{background:#fff; border: none; padding:0;}
+      .doc p,.doc li{color:#000;}
+      .doc .meta{color:#444;}
+      .doc .hr{background:#ddd;}
+    }
+  </style>
+</head>
+
+<body>
+<header class="noprint">
+  <div class="wrap">
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <h1>Journal Club — JSON → Document</h1>
+        <div class="sub">Paste JSON (AI can generate it) → Render → Export as MD / Word (.doc) / HTML / Print to PDF</div>
+      </div>
+      <div class="row">
+        <span class="pill" id="statusPill">Ready</span>
+
+        <button class="btn primary" id="btnRender">Render</button>
+        <button class="btn" id="btnExample">Load Example</button>
+
+        <label class="btn" style="margin:0;">
+          Load JSON file
+          <input type="file" id="fileIn" accept="application/json" style="display:none;">
+        </label>
+
+        <button class="btn" id="btnDownloadJson">Download JSON</button>
+        <button class="btn" id="btnDownloadMd">Download Markdown</button>
+        <button class="btn" id="btnDownloadDoc">Download Word (.doc)</button>
+        <button class="btn" id="btnDownloadHtml">Download HTML</button>
+        <button class="btn" id="btnPrint">Print / Save as PDF</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <div class="grid">
+      <section class="card">
+        <div class="hd">
+          <div class="h">Input JSON (AI fills this)</div>
+          <div class="hint">New: <code>append_map</code> supports <code>{"section_id":"text"}</code> appends</div>
+        </div>
+        <div class="bd">
+          <textarea id="jsonIn"></textarea>
+          <div id="errBox" class="err" style="display:none;"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="hd">
+          <div class="h">Rendered Document (compiled)</div>
+          <div class="hint">Exports are based on this compiled view</div>
+        </div>
+        <div class="bd">
+          <div id="docOut" class="doc">
+            <div class="hint">Click <b>Render</b> to generate the document.</div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+
+  const jsonIn = $("jsonIn");
+  const docOut = $("docOut");
+  const errBox = $("errBox");
+  const statusPill = $("statusPill");
+
+  const btnRender = $("btnRender");
+  const btnExample = $("btnExample");
+  const fileIn = $("fileIn");
+
+  const btnDownloadJson = $("btnDownloadJson");
+  const btnDownloadMd = $("btnDownloadMd");
+  const btnDownloadDoc = $("btnDownloadDoc");
+  const btnDownloadHtml = $("btnDownloadHtml");
+  const btnPrint = $("btnPrint");
+
+  const LS_KEY = "jc_json_doc_v2_append_map";
+
+  // --- Example JSON (includes instructions at top) ---
+  const EXAMPLE = {
+    "_instructions": [
+      "This JSON is the single source of truth for the Journal Club document.",
+      "",
+      "Compilation order:",
+      "1) Start with `sections` as base text.",
+      "2) Apply `updates[]` IN ORDER (append/replace per update).",
+      "3) Apply `append_map` LAST (quick `{handle:text}` appends).",
+      "",
+      "Why both?",
+      "- `updates[]` is best for provenance (who/when).",
+      "- `append_map` is best for quick AI output: `{section_id: text}`.",
+      "",
+      "append_map rules:",
+      "- Keys are section ids (e.g. 'debate').",
+      "- Values may be string OR array of strings.",
+      "- Each value is appended with a blank line separator.",
+      "",
+      "Export options:",
+      "- Markdown: best for versioning + posting.",
+      "- Word (.doc): Word-compatible HTML (no backend).",
+      "- PDF: use Print → Save as PDF.",
+      "- HTML: upload to GitHub Pages or any static site.",
+      "",
+      "Required minimum fields:",
+      "- meta.title",
+      "- template.order (section ids)",
+      "- template.labels (matching labels for those ids)",
+      "- sections (object; missing ids are allowed and will render empty)",
+      "- updates (array; can be empty)"
+    ].join("\n"),
+
+    "meta": {
+      "title": "Umwelt — Perception as a World-Boundary",
+      "date": "Feb 17, 2026 • 7pm ET",
+      "participants": ["Adam", "Jody", "Agents"],
+      "reading": "https://en.wikipedia.org/wiki/Umwelt",
+      "tags": ["umwelt", "biosemiotics", "theory of mind", "agents"]
+    },
+
+    "template": {
+      "order": [
+        "thesis",
+        "counterthesis",
+        "corollaries",
+        "debate",
+        "applications",
+        "conclusions"
+      ],
+      "labels": {
+        "thesis": "Thesis",
+        "counterthesis": "Counterthesis",
+        "corollaries": "Corollaries",
+        "debate": "Debate",
+        "applications": "Real-world Applications",
+        "conclusions": "Conclusions"
+      }
+    },
+
+    "sections": {
+      "thesis": "An organism lives inside a meaning-filtered world (its Umwelt), not inside the full physical world.",
+      "counterthesis": "Umwelt is just niche in a poetic suit; everything reduces to resource competition and constraint.",
+      "corollaries": "- Different Umwelten can overlap without being nested.\n- Tools can extend our Umwelt, but often by translation not direct perception.",
+      "debate": "",
+      "applications": "- Agent design: what is inside/outside the context window?\n- Medicine/education: mismatch between patient and clinician Umwelten.\n- Safety: community as a stabilizer of interpretation.",
+      "conclusions": "Umwelt is less about what you lack and more about what *exists* for you as actionable meaning."
+    },
+
+    "updates": [
+      {
+        "op": "append",
+        "section": "debate",
+        "by": "Adam",
+        "ts": "2026-02-17T19:14:00-05:00",
+        "text": "Rose example: light and water are the 'actors' in the plant's loops, yet it produces scent/flowers that may be insensible to it—signals for pollinators. What outputs do humans emit that we don’t perceive as meaning?"
+      }
+    ],
+
+    "append_map": {
+      "debate": "Quick drop: overlap isn’t clean nesting; translation layers can model another Umwelt without making it native meaning.",
+      "conclusions": [
+        "Second quick drop: our tools enlarge reach, but not necessarily lived perception.",
+        "Third quick drop: what we emit may be more meaningful to others than to ourselves."
+      ]
+    },
+
+    "extras": {
+      "umwelt_map": {
+        "center": "Human Umwelt",
+        "rings": [
+          { "ring": 0, "items": ["language", "social tone", "time/sequence"] },
+          { "ring": 1, "items": ["vision", "touch", "pain/pleasure"] },
+          { "ring": 2, "items": ["instruments: UV, CO₂, EEG", "statistics"] },
+          { "ring": 3, "items": ["worm sensory world (modeled)"] },
+          { "ring": 4, "items": ["unknown unknowns"] }
+        ]
+      }
+    }
+  };
+
+  // --- Helpers ---
+  function setStatus(text, ok=true){
+    statusPill.textContent = text;
+    statusPill.style.borderColor = ok ? "rgba(124,201,224,.75)" : "rgba(255,107,107,.65)";
+  }
+
+  function showError(msg){
+    errBox.style.display = "block";
+    errBox.textContent = msg;
+    setStatus("JSON error", false);
+  }
+
+  function clearError(){
+    errBox.style.display = "none";
+    errBox.textContent = "";
+  }
+
+  function downloadBlob(blob, filename){
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function safeFilename(name){
+    return String(name || "journal_club").trim().replace(/[^\w\-]+/g, "_").slice(0, 80) || "journal_club";
+  }
+
+  function escapeHtml(str){
+    return String(str).replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;", "\"":"&quot;","'":"&#39;"
+    }[c]));
+  }
+
+  // Basic "nice text" rendering: paragraphs + bullets + inline **bold** + `code`
+  function renderRichText(text){
+    text = String(text || "");
+    let s = escapeHtml(text);
+
+    // Inline code: `...`
+    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    // Bold: **...**
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    // Italic: *...* (conservative)
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*([^*]|$)/g, "$1<em>$2</em>$3");
+
+    // Split into blocks by blank line
+    const blocks = s.split(/\n\s*\n/g).map(b => b.trim()).filter(Boolean);
+
+    const htmlBlocks = blocks.map(b => {
+      const lines = b.split("\n");
+      const bulletish = lines.every(line => line.startsWith("- ") || line.startsWith("• "));
+      if (bulletish){
+        const items = lines.map(line => line.replace(/^(- |• )/, "").trim()).filter(Boolean);
+        return `<ul>${items.map(it => `<li>${it}</li>`).join("")}</ul>`;
+      }
+      const withBr = b.replace(/\n/g, "<br>");
+      return `<p>${withBr}</p>`;
+    });
+
+    return htmlBlocks.join("");
+  }
+
+  function validateMinimum(doc){
+    const errs = [];
+    if (!doc || typeof doc !== "object") errs.push("Root must be a JSON object.");
+    if (!doc.meta || typeof doc.meta !== "object") errs.push("Missing `meta` object.");
+    if (!doc.meta?.title) errs.push("Missing `meta.title`.");
+    if (!doc.template || typeof doc.template !== "object") errs.push("Missing `template` object.");
+    if (!Array.isArray(doc.template?.order) || doc.template.order.length === 0) errs.push("Missing/empty `template.order` array.");
+    if (!doc.template?.labels || typeof doc.template.labels !== "object") errs.push("Missing `template.labels` object.");
+    if (!doc.sections || typeof doc.sections !== "object") errs.push("Missing `sections` object (can be empty `{}`).");
+    if (!Array.isArray(doc.updates)) errs.push("Missing `updates` array (can be empty `[]`).");
+
+    // append_map is optional; if present must be object
+    if (doc.append_map !== undefined && (typeof doc.append_map !== "object" || Array.isArray(doc.append_map) || doc.append_map === null)){
+      errs.push("`append_map` must be an object like {\"debate\":\"text\"} or omit it.");
+    }
+    return errs;
+  }
+
+  // Append helper with blank line separation
+  function appendWithSpacing(cur, add){
+    cur = String(cur || "");
+    add = String(add || "");
+    if (!add.trim()) return cur;
+    return cur.trim() ? (cur + "\n\n" + add) : add;
+  }
+
+  // Compile: sections + updates + append_map
+  function compileDocument(doc){
+    const meta = doc.meta || {};
+    const template = doc.template || {};
+    const order = Array.isArray(template.order) ? template.order : [];
+    const labels = template.labels || {};
+    const baseSections = doc.sections || {};
+    const updates = Array.isArray(doc.updates) ? doc.updates : [];
+
+    // Start with base
+    const compiled = {};
+    for (const key of order){
+      compiled[key] = String(baseSections[key] ?? "");
+    }
+
+    // Apply updates in order (create section if missing)
+    for (const u of updates){
+      if (!u || typeof u !== "object") continue;
+      const op = (u.op || "append").toLowerCase();
+      const section = String(u.section || "");
+      const text = String(u.text ?? "");
+      if (!section) continue;
+
+      if (!(section in compiled)) compiled[section] = String(baseSections[section] ?? "");
+
+      if (op === "replace"){
+        compiled[section] = text;
+      } else {
+        compiled[section] = appendWithSpacing(compiled[section], text);
+      }
+    }
+
+    // Apply append_map LAST
+    const appendMap = doc.append_map || {};
+    if (appendMap && typeof appendMap === "object" && !Array.isArray(appendMap)){
+      for (const [section, val] of Object.entries(appendMap)){
+        if (!section) continue;
+        if (!(section in compiled)) compiled[section] = String(baseSections[section] ?? "");
+
+        if (Array.isArray(val)){
+          for (const piece of val){
+            compiled[section] = appendWithSpacing(compiled[section], String(piece ?? ""));
+          }
+        } else {
+          compiled[section] = appendWithSpacing(compiled[section], String(val ?? ""));
+        }
+      }
+    }
+
+    return { meta, template: {order, labels}, compiled, updates, appendMap };
+  }
+
+  function renderToHTML(doc){
+    const { meta, template, compiled } = compileDocument(doc);
+
+    const participants = Array.isArray(meta.participants) ? meta.participants.join(", ") : (meta.participants || "");
+    const tags = Array.isArray(meta.tags) ? meta.tags.join(", ") : (meta.tags || "");
+
+    const header = `
+      <h1>${escapeHtml(meta.title || "Journal Club")}</h1>
+      <div class="meta">
+        ${meta.date ? `<div><b>Date:</b> ${escapeHtml(meta.date)}</div>` : ""}
+        ${participants ? `<div><b>Participants:</b> ${escapeHtml(participants)}</div>` : ""}
+        ${meta.reading ? `<div><b>Reading:</b> <span>${escapeHtml(meta.reading)}</span></div>` : ""}
+        ${tags ? `<div><b>Tags:</b> ${escapeHtml(tags)}</div>` : ""}
+      </div>
+      <div class="hr"></div>
+    `;
+
+    const sections = template.order.map(id => {
+      const label = template.labels?.[id] || id;
+      const body = renderRichText(compiled[id] || "");
+      return `
+        <h2>${escapeHtml(label)}</h2>
+        ${body || `<p class="muted">—</p>`}
+      `;
+    }).join("");
+
+    return header + sections;
+  }
+
+  function toMarkdown(doc){
+    const { meta, template, compiled, updates, appendMap } = compileDocument(doc);
+
+    const participants = Array.isArray(meta.participants) ? meta.participants.join(", ") : (meta.participants || "");
+    const tags = Array.isArray(meta.tags) ? meta.tags.join(", ") : (meta.tags || "");
+
+    const lines = [];
+    lines.push(`# ${meta.title || "Journal Club"}`);
+    if (meta.date) lines.push(`**Date:** ${meta.date}`);
+    if (participants) lines.push(`**Participants:** ${participants}`);
+    if (meta.reading) lines.push(`**Reading:** ${meta.reading}`);
+    if (tags) lines.push(`**Tags:** ${tags}`);
+    lines.push("");
+
+    for (const id of template.order){
+      const label = template.labels?.[id] || id;
+      lines.push(`## ${label}`);
+      lines.push((compiled[id] || "").trim() || "—");
+      lines.push("");
+    }
+
+    if (updates.length){
+      lines.push(`---`);
+      lines.push(`## Provenance (updates log)`);
+      for (const u of updates){
+        const by = u.by ? `**${u.by}**` : "**unknown**";
+        const ts = u.ts ? `(${u.ts})` : "";
+        const op = u.op || "append";
+        lines.push(`- ${ts} ${by} → \`${u.section}\` (${op}): ${String(u.text || "").replace(/\n/g, " ")}`);
+      }
+      lines.push("");
+    }
+
+    if (appendMap && typeof appendMap === "object" && Object.keys(appendMap).length){
+      lines.push(`---`);
+      lines.push(`## Quick Appends (append_map)`);
+      for (const [k,v] of Object.entries(appendMap)){
+        if (Array.isArray(v)){
+          lines.push(`- \`${k}\`: ${v.map(x => String(x)).join(" | ")}`);
+        } else {
+          lines.push(`- \`${k}\`: ${String(v)}`);
+        }
+      }
+      lines.push("");
+    }
+
+    return lines.join("\n");
+  }
+
+  function toWordDocHTML(title, bodyHtml){
+    return `
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<style>
+  body{font-family: Calibri, Arial, sans-serif; margin: 1in;}
+  h1{font-size: 20pt; margin: 0 0 10pt;}
+  h2{font-size: 13pt; margin: 16pt 0 6pt;}
+  p, li{font-size: 11pt; line-height: 1.35;}
+  .meta{color:#444; font-size: 10.5pt; margin-bottom: 10pt;}
+  .meta div{margin: 2pt 0;}
+  code{font-family: Consolas, monospace; background:#f3f3f3; padding: 1pt 4pt; border-radius: 4pt;}
+  hr{border:none; border-top:1px solid #ddd; margin:12pt 0;}
+</style>
+</head>
+<body>
+${bodyHtml.replace('<div class="hr"></div>', '<hr/>')}
+</body>
+</html>
+`.trim();
+  }
+
+  function toStandaloneHTML(title, bodyHtml){
+    return `
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>${escapeHtml(title)}</title>
+<style>
+  body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 30px; max-width: 850px;}
+  h1{font-size: 28px; margin: 0 0 10px;}
+  h2{font-size: 16px; margin: 18px 0 8px;}
+  p, li{font-size: 15px; line-height: 1.5;}
+  .meta{color:#444; font-size: 13px; display:flex; flex-wrap:wrap; gap:8px 14px; margin-bottom: 12px;}
+  code{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f3f3f3; padding: 2px 6px; border-radius: 8px;}
+  hr{border:none; border-top:1px solid #ddd; margin:14px 0;}
+</style>
+</head>
+<body>
+${bodyHtml.replace('<div class="hr"></div>', '<hr/>')}
+</body>
+</html>
+`.trim();
+  }
+
+  function saveLocal(){
+    try{ localStorage.setItem(LS_KEY, jsonIn.value); } catch(_){}
+  }
+  function loadLocal(){
+    try{
+      const raw = localStorage.getItem(LS_KEY);
+      if (raw) jsonIn.value = raw;
+      else jsonIn.value = JSON.stringify(EXAMPLE, null, 2);
+    } catch(_){
+      jsonIn.value = JSON.stringify(EXAMPLE, null, 2);
+    }
+  }
+
+  function parseJSON(){
+    clearError();
+    let doc;
+    try{
+      doc = JSON.parse(jsonIn.value);
+    } catch(e){
+      showError("JSON parse failed:\n" + e.message);
+      return null;
+    }
+    const errs = validateMinimum(doc);
+    if (errs.length){
+      showError("Validation failed:\n- " + errs.join("\n- "));
+      return null;
+    }
+    return doc;
+  }
+
+  function render(){
+    const doc = parseJSON();
+    if (!doc) return;
+    const html = renderToHTML(doc);
+    docOut.innerHTML = html;
+    setStatus("Rendered ✓", true);
+    saveLocal();
+    window.__LAST_DOC__ = doc;
+    window.__LAST_HTML__ = html;
+  }
+
+  // --- Events ---
+  btnRender.addEventListener("click", render);
+
+  btnExample.addEventListener("click", () => {
+    jsonIn.value = JSON.stringify(EXAMPLE, null, 2);
+    setStatus("Example loaded");
+    clearError();
+    saveLocal();
+  });
+
+  jsonIn.addEventListener("input", () => {
+    setStatus("Edited");
+    saveLocal();
+  });
+
+  fileIn.addEventListener("change", async () => {
+    const f = fileIn.files && fileIn.files[0];
+    if (!f) return;
+    try{
+      const text = await f.text();
+      JSON.parse(text);
+      jsonIn.value = text;
+      setStatus("Loaded file");
+      clearError();
+      saveLocal();
+    } catch(e){
+      showError("Could not load JSON file:\n" + e.message);
+    } finally {
+      fileIn.value = "";
+    }
+  });
+
+  btnDownloadJson.addEventListener("click", () => {
+    const doc = parseJSON();
+    if (!doc) return;
+    const title = doc.meta?.title || "journal_club";
+    const blob = new Blob([JSON.stringify(doc, null, 2)], {type:"application/json"});
+    downloadBlob(blob, safeFilename(title) + ".json");
+  });
+
+  btnDownloadMd.addEventListener("click", () => {
+    const doc = parseJSON();
+    if (!doc) return;
+    const md = toMarkdown(doc);
+    const title = doc.meta?.title || "journal_club";
+    downloadBlob(new Blob([md], {type:"text/markdown"}), safeFilename(title) + ".md");
+  });
+
+  btnDownloadDoc.addEventListener("click", () => {
+    const doc = parseJSON();
+    if (!doc) return;
+    const html = renderToHTML(doc);
+    const title = doc.meta?.title || "journal_club";
+    const word = toWordDocHTML(title, html);
+    downloadBlob(new Blob([word], {type:"application/msword"}), safeFilename(title) + ".doc");
+  });
+
+  btnDownloadHtml.addEventListener("click", () => {
+    const doc = parseJSON();
+    if (!doc) return;
+    const html = renderToHTML(doc);
+    const title = doc.meta?.title || "journal_club";
+    const page = toStandaloneHTML(title, html);
+    downloadBlob(new Blob([page], {type:"text/html"}), safeFilename(title) + ".html");
+  });
+
+  btnPrint.addEventListener("click", () => {
+    render();
+    window.print();
+  });
+
+  // --- Init ---
+  loadLocal();
+  try { render(); } catch(_) {}
+})();
+</script>
+</body>
+</html>
