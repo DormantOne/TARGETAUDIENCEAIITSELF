@@ -1,0 +1,4319 @@
+======================================================================
+CODE MAP
+======================================================================
+
+Total Files: 4  |  Total Lines: 4,253
+Functions: 40  |  Classes: 8
+
+File Types:
+  🎨 css: 1 files, 226 lines
+  🌐 html: 1 files, 201 lines
+  📜 javascript: 1 files, 1,120 lines
+  🐍 python: 1 files, 2,706 lines
+
+External Dependencies: fastapi
+
+----------------------------------------------------------------------
+FILES AND STRUCTURE
+----------------------------------------------------------------------
+
+📁 (root)/
+  🐍 mazekg_app.py (2706 lines)
+      Variables: DIRS, OPP_DIR, app, game
+      Functions: in_bounds, root, get_state, do_step, do_reset, do_new_maze +13 more
+      Class Monster: 0 methods
+      Class Maze: 13 methods
+      Class KGNode: 0 methods
+      Class KGEdge: 0 methods
+      ... +4 more classes
+
+📁 static/
+  📜 app.js (1120 lines)
+      Functions: loadLLMConfig, pushLLMConfig, stopLoop, loop, post, postJSON +15 more
+  🌐 index.html (201 lines)
+      Variables: scripts:2, styles:1
+  🎨 style.css (226 lines)
+      Variables: rules:41
+
+
+######################################################################
+# SOURCE CODE
+######################################################################
+
+#=====================================================================
+# 🐍 FILE: mazekg_app.py (2706 lines)
+#=====================================================================
+
+#=====================================================================
+# 🐍 FILE: mazekg_app.py (2578 lines)
+#=====================================================================
+
+import random
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Set, Any
+import os
+import json
+import time
+import ast
+import re
+import urllib.request
+import urllib.error
+import math
+import traceback
+
+from fastapi import FastAPI, Body
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+# ----------------------------
+# Maze representation (bitmask walls)
+# 1=N, 2=E, 4=S, 8=W
+# ----------------------------
+N, E, S, W = 1, 2, 4, 8
+DIRS = {
+    "N": (0, -1, N, S),
+    "E": (1, 0, E, W),
+    "S": (0, 1, S, N),
+    "W": (-1, 0, W, E),
+}
+OPP_DIR = {"N": "S", "S": "N", "E": "W", "W": "E"}
+
+
+def in_bounds(x: int, y: int, w: int, h: int) -> bool:
+    return 0 <= x < w and 0 <= y < h
+
+@dataclass
+class Monster:
+    id: str
+    kind: str  # small, medium, big
+    x: int
+    y: int
+    level: int  # 1, 2, 3
+    damage: int
+    hp: int = 10
+    max_hp: int = 10
+
+class Maze:
+    """
+    True maze + world items + monsters.
+    Agent learns only via observation along line-of-sight.
+    """
+
+    def __init__(self, w: int, h: int, seed: Optional[int] = None, 
+                 monster_hp_scale: float = 1.0, monster_dmg_scale: float = 1.0):
+        self.w = w
+        self.h = h
+        self.rng = random.Random(seed)
+        self.monster_hp_scale = monster_hp_scale
+        self.monster_dmg_scale = monster_dmg_scale
+
+        # start with all walls
+        self.walls = [[N | E | S | W for _ in range(w)] for _ in range(h)]
+
+        self.start = (0, 0)
+        self.key = (w - 2, h - 2)
+        self.exit = (w - 1, h - 1)
+
+        # items: (x,y)-> dict
+        self.items: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self.monsters: List[Monster] = []
+
+        self._carve()
+        self._place_key_exit_far()
+        self._place_items()
+        self._place_monsters()
+
+    def _carve(self):
+        w, h = self.w, self.h
+        visited = [[False for _ in range(w)] for _ in range(h)]
+        sx, sy = self.start
+        stack = [(sx, sy)]
+        visited[sy][sx] = True
+
+        while stack:
+            x, y = stack[-1]
+            neighbors = []
+            for name, (dx, dy, wall_here, wall_there) in DIRS.items():
+                nx, ny = x + dx, y + dy
+                if in_bounds(nx, ny, w, h) and not visited[ny][nx]:
+                    neighbors.append((name, nx, ny, wall_here, wall_there))
+
+            if not neighbors:
+                stack.pop()
+                continue
+
+            name, nx, ny, wall_here, wall_there = self.rng.choice(neighbors)
+
+            self.walls[y][x] &= ~wall_here
+            self.walls[ny][nx] &= ~wall_there
+
+            visited[ny][nx] = True
+            stack.append((nx, ny))
+
+        self._create_rooms()
+
+    def _create_rooms(self, room_count: int = 3, min_room_size: int = 2, max_room_size: int = 3):
+        banned = {self.start, self.key, self.exit}
+        rooms_created = 0
+        attempts = 0
+        max_attempts = 50
+
+        while rooms_created < room_count and attempts < max_attempts:
+            attempts += 1
+            room_size = self.rng.randint(min_room_size, max_room_size)
+            margin = room_size
+
+            if self.w <= margin * 2 or self.h <= margin * 2:
+                continue
+
+            cx = self.rng.randint(margin, self.w - margin - 1)
+            cy = self.rng.randint(margin, self.h - margin - 1)
+
+            room_cells = []
+            valid = True
+            for dy in range(room_size):
+                for dx in range(room_size):
+                    rx, ry = cx + dx, cy + dy
+                    if not in_bounds(rx, ry, self.w, self.h):
+                        valid = False
+                        break
+                    if (rx, ry) in banned:
+                        valid = False
+                        break
+                    room_cells.append((rx, ry))
+                if not valid:
+                    break
+
+            if not valid or len(room_cells) < room_size * room_size:
+                continue
+
+            for (rx, ry) in room_cells:
+                for (rx2, ry2) in room_cells:
+                    if rx == rx2 and ry == ry2:
+                        continue
+                    if abs(rx - rx2) + abs(ry - ry2) == 1:
+                        if rx2 == rx + 1:  # rx2 is East of rx
+                            self.walls[ry][rx] &= ~E
+                            self.walls[ry2][rx2] &= ~W
+                        elif rx2 == rx - 1:  # rx2 is West
+                            self.walls[ry][rx] &= ~W
+                            self.walls[ry2][rx2] &= ~E
+                        elif ry2 == ry + 1:  # ry2 is South
+                            self.walls[ry][rx] &= ~S
+                            self.walls[ry2][rx2] &= ~N
+                        elif ry2 == ry - 1:  # ry2 is North
+                            self.walls[ry][rx] &= ~N
+                            self.walls[ry2][rx2] &= ~S
+
+            rooms_created += 1
+
+    def _neighbors_open(self, x: int, y: int) -> List[Tuple[str, int, int]]:
+        out = []
+        cell = self.walls[y][x]
+        for name, (dx, dy, wall_here, _) in DIRS.items():
+            nx, ny = x + dx, y + dy
+            if in_bounds(nx, ny, self.w, self.h):
+                if (cell & wall_here) == 0:
+                    out.append((name, nx, ny))
+        return out
+
+    def _bfs_dist(self, src: Tuple[int, int]) -> Dict[Tuple[int, int], int]:
+        from collections import deque
+        dist = {src: 0}
+        q = deque([src])
+        while q:
+            x, y = q.popleft()
+            for _, nx, ny in self._neighbors_open(x, y):
+                if (nx, ny) not in dist:
+                    dist[(nx, ny)] = dist[(x, y)] + 1
+                    q.append((nx, ny))
+        return dist
+
+    def _place_key_exit_far(self):
+        dist = self._bfs_dist(self.start)
+        far_cells = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
+
+        # Place exit at the farthest point from start
+        self.exit = far_cells[0][0]
+        
+        # Place key at a RANDOM location that is:
+        # 1. Not the start
+        # 2. Not the exit  
+        # 3. Not adjacent to the exit (manhattan distance > 1)
+        # 4. At least 3 steps from start (so it's not trivially easy)
+        valid_key_cells = []
+        for (cell, d) in dist.items():
+            if cell == self.start or cell == self.exit:
+                continue
+            md_to_exit = abs(cell[0] - self.exit[0]) + abs(cell[1] - self.exit[1])
+            if md_to_exit > 1 and d >= 3:  # Not adjacent to exit, at least 3 steps from start
+                valid_key_cells.append(cell)
+        
+        if valid_key_cells:
+            self.key = self.rng.choice(valid_key_cells)
+        else:
+            # Fallback: just pick something not adjacent to exit
+            for (cell, d) in far_cells[1:]:
+                if cell == self.start or cell == self.exit:
+                    continue
+                md = abs(cell[0] - self.exit[0]) + abs(cell[1] - self.exit[1])
+                if md > 1:
+                    self.key = cell
+                    break
+
+    def _rand_empty_cell(self, banned: Set[Tuple[int, int]]):
+        while True:
+            x = self.rng.randrange(self.w)
+            y = self.rng.randrange(self.h)
+            p = (x, y)
+            if p in banned:
+                continue
+            if p in self.items:
+                continue
+            if any(m.x == x and m.y == y for m in self.monsters):
+                continue
+            return p
+
+    def _place_items(self):
+        banned = {self.start, self.key, self.exit}
+        dist = self._bfs_dist(self.start)
+        near = [cell for cell, d in dist.items() if 2 <= d <= 6 and cell not in banned]
+        self.rng.shuffle(near)
+
+        if near:
+            p = near.pop()
+            self.items[p] = {"type": "food", "amount": self.rng.randint(22, 36), "respawn": True}
+        if near:
+            p = near.pop()
+            self.items[p] = {"type": "oil", "amount": self.rng.randint(10, 18)}
+
+        rubble_count = max(2, (self.w * self.h) // 16)
+        for _ in range(rubble_count):
+            p = self._rand_empty_cell(banned)
+            self.items[p] = {"type": "rubble", "cost": self.rng.randint(1, 2)}
+        
+        # Weapons
+        p1 = self._rand_empty_cell(banned)
+        self.items[p1] = {"type": "weapon", "level": 1, "name": "Stun Baton (+1)"}
+        
+        p2 = self._rand_empty_cell(banned)
+        self.items[p2] = {"type": "weapon", "level": 2, "name": "Plasma Cutter (+2)"}
+
+        oil_total = max(4, (self.w * self.h) // 45)
+        food_total = max(6, (self.w * self.h) // 36)
+
+        for _ in range(oil_total):
+            p = self._rand_empty_cell(banned)
+            self.items[p] = {"type": "oil", "amount": self.rng.randint(8, 14)}
+
+        for _ in range(food_total):
+            p = self._rand_empty_cell(banned)
+            self.items[p] = {"type": "food", "amount": self.rng.randint(20, 34), "respawn": True}
+
+    def _place_monsters(self):
+        banned = {self.start, self.key, self.exit}
+        # Kind, Level, Base Dmg
+        defs = [
+            ("small", 1, 1),
+            ("medium", 2, 2),
+            ("big", 3, 3)
+        ]
+        
+        for kind, lvl, dmg in defs:
+            p = self._rand_empty_cell(banned)
+            # Base HP: Small=6, Med=10, Big=16
+            base_hp = 4 + (lvl * 4) + (2 if lvl==3 else 0)
+            
+            final_hp = int(base_hp * self.monster_hp_scale)
+            final_dmg = int(dmg * self.monster_dmg_scale)
+            # Ensure at least 1 dmg
+            final_dmg = max(1, final_dmg)
+            
+            self.monsters.append(Monster(
+                id=f"mnst_{self.rng.randint(1000,9999)}",
+                kind=kind,
+                x=p[0],
+                y=p[1],
+                level=lvl,
+                damage=final_dmg,
+                hp=final_hp,
+                max_hp=final_hp
+            ))
+
+    def can_move(self, x: int, y: int, dname: str) -> bool:
+        cell = self.walls[y][x]
+        dx, dy, wall_here, _ = DIRS[dname]
+        nx, ny = x + dx, y + dy
+        if not in_bounds(nx, ny, self.w, self.h):
+            return False
+        return (cell & wall_here) == 0
+
+    def check_los(self, x1: int, y1: int, x2: int, y2: int, limit: int = 10) -> bool:
+        if x1 == x2 and y1 == y2: return True
+        if x1 == x2:
+            step = 1 if y2 > y1 else -1
+            for y in range(y1, y2, step):
+                dname = "S" if step > 0 else "N"
+                if not self.can_move(x1, y, dname):
+                    return False
+            return True
+        elif y1 == y2:
+            step = 1 if x2 > x1 else -1
+            for x in range(x1, x2, step):
+                dname = "E" if step > 0 else "W"
+                if not self.can_move(x, y1, dname):
+                    return False
+            return True
+        return False
+
+    def observe_cell(self, x: int, y: int) -> Dict[str, Any]:
+        cell = self.walls[y][x]
+        open_dirs = []
+        blocked_dirs = []
+
+        for name, (dx, dy, wall_here, _) in DIRS.items():
+            if (cell & wall_here) == 0:
+                open_dirs.append(name)
+            else:
+                blocked_dirs.append(name)
+
+        item = self.items.get((x, y))
+        
+        monster_here = None
+        for m in self.monsters:
+            if m.x == x and m.y == y:
+                monster_here = {
+                    "id": m.id,
+                    "kind": m.kind,
+                    "level": m.level,
+                    "hp": m.hp,
+                    "max_hp": m.max_hp,
+                    "damage": m.damage
+                }
+                break
+
+        return {
+            "pos": (x, y),
+            "open_dirs": open_dirs,
+            "blocked_dirs": blocked_dirs,
+            "has_key_here": (x, y) == self.key,
+            "has_exit_here": (x, y) == self.exit,
+            "item": item,
+            "monster": monster_here
+        }
+
+    def visible_cells(self, x: int, y: int, vision: int) -> Set[Tuple[int, int]]:
+        vision = max(1, int(vision))
+        vis = {(x, y)}
+        for dname, (dx, dy, _, _) in DIRS.items():
+            cx, cy = x, y
+            for _ in range(vision):
+                if not self.can_move(cx, cy, dname):
+                    break
+                cx, cy = cx + dx, cy + dy
+                vis.add((cx, cy))
+        return vis
+
+
+# ----------------------------
+# KG schema
+# ----------------------------
+@dataclass
+class KGNode:
+    id: str
+    kind: str
+    x: float
+    y: float
+    visits: int = 0
+    seen: int = 0
+    frontier: bool = False
+    tags: List[str] = field(default_factory=list)
+    attrs: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class KGEdge:
+    source: str
+    target: str
+    rel: str
+    action: Optional[str] = None
+    confidence: float = 0.2
+    kind: str = "observed"
+    last_touch_step: int = 0
+
+@dataclass
+class KGMemory:
+    id: str
+    text: str
+    importance: float
+    step_created: int
+    step_last_accessed: int
+    context_tags: List[str] = field(default_factory=list)
+    linked_nodes: List[str] = field(default_factory=list)
+    attrs: Dict[str, Any] = field(default_factory=dict)
+
+
+class KnowledgeGraph:
+    def __init__(self):
+        self.nodes: Dict[str, KGNode] = {}
+        self.edges: Dict[Tuple[str, str, str, Optional[str]], KGEdge] = {}
+        self.memories: Dict[str, KGMemory] = {}
+        self._memory_counter: int = 0
+
+    def cell_id(self, x: int, y: int) -> str:
+        return f"cell:{x},{y}"
+
+    def obj_id(self, otype: str, x: int, y: int) -> str:
+        return f"obj:{otype}:{x},{y}"
+    
+    def monster_id(self, mid: str) -> str:
+        return f"monster:{mid}"
+
+    def region_id(self, rtype: str, idx: int) -> str:
+        return f"region:{rtype}:{idx}"
+
+    def agent_id(self) -> str:
+        return "agent:player"
+
+    def memory_id(self) -> str:
+        self._memory_counter += 1
+        return f"mem:{self._memory_counter}"
+
+    def ensure_node(self, nid: str, kind: str, x: float, y: float, step: int) -> KGNode:
+        if nid not in self.nodes:
+            self.nodes[nid] = KGNode(id=nid, kind=kind, x=x, y=y)
+            self.nodes[nid].attrs["born_step"] = step
+            self.nodes[nid].attrs["last_seen_step"] = step
+            self.nodes[nid].attrs["last_used_step"] = step
+        return self.nodes[nid]
+
+    def touch_node(self, nid: str, step: int, used: bool = False):
+        n = self.nodes.get(nid)
+        if not n:
+            return
+        n.attrs["last_seen_step"] = step
+        if used:
+            n.attrs["last_used_step"] = step
+
+    def bump_edge(self, src: str, dst: str, rel: str, action: Optional[str], kind: str, step: int):
+        key = (src, dst, rel, action)
+        if key not in self.edges:
+            self.edges[key] = KGEdge(
+                source=src, target=dst, rel=rel, action=action,
+                kind=kind, confidence=0.2, last_touch_step=step
+            )
+        else:
+            e = self.edges[key]
+            e.last_touch_step = step
+            e.confidence = min(1.0, e.confidence + (0.25 if kind == "traversed" else 0.05))
+            if kind == "traversed":
+                e.kind = "traversed"
+
+    def add_memory(self, text: str, importance: float, context_tags: List[str], linked_nodes: List[str], step: int) -> KGMemory:
+        mid = self.memory_id()
+        importance = max(0.0, min(1.0, float(importance)))
+        mem = KGMemory(
+            id=mid,
+            text=text,
+            importance=importance,
+            step_created=step,
+            step_last_accessed=step,
+            context_tags=list(context_tags) if context_tags else [],
+            linked_nodes=list(linked_nodes) if linked_nodes else [],
+            attrs={}
+        )
+        self.memories[mid] = mem
+        return mem
+
+    def search_memories(self, current_context_tags: List[str], top_k: int = 5, min_importance: float = 0.0, step: int = 0) -> List[Tuple[KGMemory, float]]:
+        if not self.memories:
+            return []
+        current_set = set(current_context_tags) if current_context_tags else set()
+        half_life = 150.0
+        results = []
+        for mem in self.memories.values():
+            if mem.importance < min_importance:
+                continue
+            mem_set = set(mem.context_tags) if mem.context_tags else set()
+            if current_set and mem_set:
+                intersection = len(current_set & mem_set)
+                union = len(current_set | mem_set)
+                relevance = intersection / union if union > 0 else 0.0
+            else:
+                relevance = 0.5
+            age = max(0, step - mem.step_created)
+            recency = math.exp(-age / half_life)
+            score = mem.importance * (0.3 + 0.7 * relevance) * (0.4 + 0.6 * recency)
+            results.append((mem, score))
+        results.sort(key=lambda x: x[1], reverse=True)
+        for mem, _ in results[:top_k]:
+            mem.step_last_accessed = step
+        return results[:top_k]
+
+    def search_memories_by_importance(self, top_k: int = 10, min_importance: float = 0.5) -> List[KGMemory]:
+        results = [m for m in self.memories.values() if m.importance >= min_importance]
+        results.sort(key=lambda m: m.importance, reverse=True)
+        return results[:top_k]
+
+    def prune(self, step: int, node_ttl: int, edge_ttl: int):
+        edge_kill = []
+        for k, e in self.edges.items():
+            age = step - int(e.last_touch_step)
+            if age > edge_ttl:
+                edge_kill.append(k)
+        for k in edge_kill:
+            del self.edges[k]
+
+        node_kill = []
+        for nid, n in self.nodes.items():
+            if n.kind in ("agent", "region"):
+                continue
+            if "key" in (n.tags or []) or "exit" in (n.tags or []):
+                continue
+            if n.kind == "monster":
+                last_seen = int(n.attrs.get("last_seen_step", step))
+                if (step - last_seen) > 20: 
+                    node_kill.append(nid)
+                continue
+            last_seen = int(n.attrs.get("last_seen_step", step))
+            last_used = int(n.attrs.get("last_used_step", step))
+            age = step - max(last_seen, last_used)
+            base_ttl = node_ttl + (120 if n.visits > 0 else 0)
+            if age > base_ttl:
+                node_kill.append(nid)
+        for nid in node_kill:
+            del self.nodes[nid]
+
+        kill_edges = [k for k, e in self.edges.items() if e.source not in self.nodes or e.target not in self.nodes]
+        for k in kill_edges:
+            del self.edges[k]
+
+        memory_kill = []
+        for mid, m in self.memories.items():
+            age = step - m.step_last_accessed
+            effective_ttl = node_ttl * (0.5 + m.importance)
+            if age > effective_ttl:
+                memory_kill.append(mid)
+        for mid in memory_kill:
+            del self.memories[mid]
+
+    def remove_nodes_by_kind(self, kind: str):
+        kill = {nid for nid, n in self.nodes.items() if n.kind == kind}
+        if not kill:
+            return
+        for nid in kill:
+            del self.nodes[nid]
+        edge_kill = [k for k, e in self.edges.items() if (e.source in kill) or (e.target in kill)]
+        for k in edge_kill:
+            del self.edges[k]
+
+    def to_json(self, step: int):
+        nodes_out = []
+        for n in self.nodes.values():
+            last_seen = int(n.attrs.get("last_seen_step", step))
+            last_used = int(n.attrs.get("last_used_step", step))
+            nodes_out.append({
+                "id": n.id,
+                "kind": n.kind,
+                "x": n.x,
+                "y": n.y,
+                "visits": n.visits,
+                "seen": n.seen,
+                "frontier": n.frontier,
+                "tags": n.tags,
+                "attrs": n.attrs,
+                "age_seen": step - last_seen,
+                "age_used": step - last_used,
+            })
+        edges_out = []
+        for e in self.edges.values():
+            edges_out.append({
+                "source": e.source,
+                "target": e.target,
+                "rel": e.rel,
+                "action": e.action,
+                "confidence": e.confidence,
+                "kind": e.kind,
+                "last_touch_step": e.last_touch_step,
+                "age_touch": step - int(e.last_touch_step),
+            })
+        memories_out = []
+        for m in self.memories.values():
+            age = step - m.step_created
+            memories_out.append({
+                "id": m.id,
+                "text": m.text,
+                "importance": m.importance,
+                "step_created": m.step_created,
+                "step_last_accessed": m.step_last_accessed,
+                "context_tags": m.context_tags,
+                "linked_nodes": m.linked_nodes,
+                "age": age,
+            })
+        return {"nodes": nodes_out, "edges": edges_out, "memories": memories_out}
+
+
+# ----------------------------
+# Agent + Game logic
+# ----------------------------
+class Agent:
+    def __init__(self, x: int, y: int, energy: int, oil: int):
+        self.x = x
+        self.y = y
+        self.has_key = False
+        self.steps = 0
+        self.mode = "explore"
+        self.last_plan: List[str] = []
+        self.last_action: Optional[str] = None
+        self.escaped = False
+        self.energy = int(energy)
+        self.oil = int(oil)
+        self.weapon_power = 0 # 0=Unarmed(dmg 1), 1=Baton(dmg 2), 2=Plasma(dmg 3)
+
+
+class Game:
+    def __init__(self, w: int = 18, h: int = 12, seed: Optional[int] = None):
+        # MODIFIED: Initialize scaling factors FIRST to avoid undefined errors if new_maze is called immediately
+        self.monster_hp_scale = 1.0
+        self.monster_dmg_scale = 1.0
+        
+        self.w = w
+        self.h = h
+        self.rng = random.Random(seed)
+        self.start_energy = 80
+        self.start_oil = 6
+        self.food_respawn_min = 30
+        self.food_respawn_max = 55
+        self.node_ttl = 260
+        self.edge_ttl = 320
+
+        self.ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+        self.ollama_model = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+        self.llm_enabled = False
+        self.llm_checkin_every = 4
+        self.llm_allow_choose_next = True
+        self.llm_steps_until_checkin = 0
+        self.llm_current_lens: Optional[str] = None
+        self.llm_action_override: Optional[str] = None
+        self.llm_target_cell: Optional[str] = None
+        self.llm_last_narrative: str = ""
+        self.llm_last_trace: Dict[str, Any] = {}
+        self.llm_last_raw: str = ""
+        self.llm_last_error: str = ""
+        self.event_log: List[Dict[str, Any]] = []
+        self.path_log: List[Tuple[int, int]] = []
+        self.action_log: List[str] = []
+        self.respawn_queue: List[Dict[str, Any]] = []
+        
+        # Reflection system - allows LLM to query KG without consuming resources
+        self.reflection_enabled = True
+        self.last_was_reflection = False  # Track if last LLM action was a reflection
+        self.reflection_history: List[Dict[str, Any]] = []  # Store recent reflections
+        
+        # Detailed move history for LLM awareness
+        self.move_history: List[Dict[str, Any]] = []  # Detailed move records
+        self.max_move_history = 20
+        
+        self.new_maze()
+
+    def config(self) -> Dict[str, Any]:
+        """Return current game configuration values."""
+        return {
+            "start_energy": int(self.start_energy),
+            "start_oil": int(self.start_oil),
+            "node_ttl": int(self.node_ttl),
+            "edge_ttl": int(self.edge_ttl),
+            "monster_hp_scale": float(self.monster_hp_scale),
+            "monster_dmg_scale": float(self.monster_dmg_scale),
+        }
+
+    def _new_agent(self) -> Agent:
+        sx, sy = self.maze.start
+        return Agent(sx, sy, energy=self.start_energy, oil=self.start_oil)
+
+    def new_maze(self):
+        self.maze = Maze(
+            self.w, self.h, 
+            seed=self.rng.randint(0, 10_000_000),
+            monster_hp_scale=self.monster_hp_scale,
+            monster_dmg_scale=self.monster_dmg_scale
+        )
+        self.agent = self._new_agent()
+        self.kg = KnowledgeGraph()
+        self.visible: Set[Tuple[int, int]] = set()
+        self.respawn_queue = []
+        self.event_log = []
+        self.path_log = [(self.agent.x, self.agent.y)]
+        self.action_log = []
+        self.move_history = []  # Reset detailed move history
+        self.reflection_history = []  # Reset reflection history
+        self.last_was_reflection = False
+        self.llm_steps_until_checkin = 0
+        self.llm_last_trace = {}
+        self.llm_target_cell = None
+        self.llm_last_narrative = ""
+        self.llm_last_raw = ""
+        self.llm_last_error = ""
+        self._update_visibility_and_observe()
+        self._sync_agent_node()
+        self._rebuild_regions()
+
+    def reset_same_maze(self):
+        self.agent = self._new_agent()
+        self.kg = KnowledgeGraph()
+        self.visible = set()
+        self.respawn_queue = []
+        self.event_log = []
+        self.path_log = [(self.agent.x, self.agent.y)]
+        self.action_log = []
+        self.move_history = []  # Reset detailed move history
+        self.reflection_history = []  # Reset reflection history
+        self.last_was_reflection = False
+        self.llm_steps_until_checkin = 0
+        self.llm_last_trace = {}
+        self.llm_target_cell = None
+        self.llm_last_narrative = ""
+        self.llm_last_raw = ""
+        self.llm_last_error = ""
+        self._update_visibility_and_observe()
+        self._sync_agent_node()
+        self._rebuild_regions()
+
+    def _tick_respawns(self):
+        if not self.respawn_queue:
+            return
+        now = self.agent.steps
+        keep = []
+        for ev in self.respawn_queue:
+            if now < ev["due_step"]:
+                keep.append(ev)
+                continue
+            pos = tuple(ev["pos"])
+            if pos in self.maze.items:
+                keep.append(ev)
+                continue
+            if any(m.x == pos[0] and m.y == pos[1] for m in self.maze.monsters):
+                keep.append(ev)
+                continue
+            self.maze.items[pos] = {"type": "food", "amount": ev["amount"], "respawn": True}
+        self.respawn_queue = keep
+
+    def _sync_agent_node(self):
+        a = self.agent
+        step = a.steps
+        aid = self.kg.agent_id()
+        an = self.kg.ensure_node(aid, "agent", a.x + 0.5, a.y + 0.5, step)
+        an.tags = ["agent", "state"]
+        an.attrs.update({"hp": a.energy, "oil": a.oil, "has_key": a.has_key, "mode": a.mode, "weapon_power": a.weapon_power})
+        self.kg.touch_node(aid, step, used=True)
+        kill = [k for k, e in self.kg.edges.items() if e.source == aid and e.rel == "at"]
+        for k in kill:
+            del self.kg.edges[k]
+        cur_cell = self.kg.cell_id(a.x, a.y)
+        self.kg.bump_edge(aid, cur_cell, "at", None, "traversed", step)
+        self.kg.touch_node(cur_cell, step, used=True)
+
+    def _update_visibility_and_observe(self):
+        a = self.agent
+        step = a.steps
+        if a.oil >= 4:
+            vis_range = 6
+        else:
+            vis_range = max(1, a.oil + 2)
+        
+        self.visible = self.maze.visible_cells(a.x, a.y, vision=vis_range)
+
+        for (vx, vy) in self.visible:
+            obs = self.maze.observe_cell(vx, vy)
+            self._write_observation(obs, is_current=(vx == a.x and vy == a.y), step=step)
+
+    def _write_observation(self, obs: Dict[str, Any], is_current: bool, step: int):
+        x, y = obs["pos"]
+        nid = self.kg.cell_id(x, y)
+        node = self.kg.ensure_node(nid, "cell", x, y, step)
+        node.seen += 1
+        node.attrs["last_seen_step"] = step
+        self.kg.touch_node(nid, step, used=is_current)
+
+        if is_current:
+            node.visits += 1
+            node.attrs["last_visit_step"] = step
+
+        node.attrs["ruled_out_key"] = (not obs["has_key_here"])
+        node.attrs["ruled_out_exit"] = (not obs["has_exit_here"])
+
+        if obs["has_key_here"] and "key" not in node.tags:
+            node.tags.append("key")
+        if obs["has_exit_here"] and "exit" not in node.tags:
+            node.tags.append("exit")
+
+        item = obs.get("item")
+        if item:
+            t = item["type"]
+            if t not in node.tags:
+                node.tags.append(t)
+
+            if t in ("oil", "food", "weapon"):
+                oid = self.kg.obj_id(t, x, y)
+                on = self.kg.ensure_node(oid, "object", x + 0.18, y + 0.18, step)
+                on.tags = [t, "box"]
+                on.attrs["type"] = t
+                if t == "weapon":
+                    on.attrs["level"] = item.get("level", 0)
+                    on.attrs["name"] = item.get("name", "Unknown")
+                else:
+                    on.attrs["amount"] = int(item.get("amount", 0))
+                
+                if t == "food":
+                    on.attrs["respawn"] = bool(item.get("respawn", True))
+                self.kg.touch_node(oid, step, used=False)
+                self.kg.bump_edge(oid, nid, "located_at", None, "observed", step)
+                self.kg.bump_edge(nid, oid, "has_object", None, "observed", step)
+            elif t == "rubble":
+                node.attrs["rubble_cost"] = int(item.get("cost", 1))
+
+        monster = obs.get("monster")
+        if monster:
+            mid = self.kg.monster_id(monster["id"])
+            mn = self.kg.ensure_node(mid, "monster", x+0.5, y+0.5, step)
+            mn.tags = ["monster", monster["kind"], "hostile"]
+            mn.attrs["level"] = monster["level"]
+            mn.attrs["kind"] = monster["kind"]
+            mn.attrs["hp"] = monster["hp"]
+            mn.attrs["max_hp"] = monster["max_hp"]
+            self.kg.touch_node(mid, step, used=False)
+            self.kg.bump_edge(mid, nid, "at", None, "observed", step)
+
+        for dname in obs["open_dirs"]:
+            dx, dy, _, _ = DIRS[dname]
+            nx, ny = x + dx, y + dy
+            nnid = self.kg.cell_id(nx, ny)
+            if nnid in self.kg.nodes:
+                self.kg.bump_edge(nid, nnid, "move", dname, "observed", step)
+
+        frontier = False
+        for dname in obs["open_dirs"]:
+            dx, dy, _, _ = DIRS[dname]
+            nx, ny = x + dx, y + dy
+            nnid = self.kg.cell_id(nx, ny)
+            if nnid not in self.kg.nodes:
+                frontier = True
+                break
+        node.frontier = frontier
+
+    def _adj_cells(self) -> Dict[str, List[str]]:
+        adj: Dict[str, List[str]] = {}
+        for e in self.kg.edges.values():
+            if e.rel != "move": continue
+            if not (e.source.startswith("cell:") and e.target.startswith("cell:")): continue
+            adj.setdefault(e.source, []).append(e.target)
+        return adj
+
+    def _bfs_path(self, start: str, goals: Set[str]) -> Optional[List[str]]:
+        from collections import deque
+        if start in goals: return [start]
+        adj = self._adj_cells()
+        q = deque([start])
+        prev: Dict[str, Optional[str]] = {start: None}
+        while q:
+            cur = q.popleft()
+            for nxt in adj.get(cur, []):
+                if nxt in prev: continue
+                prev[nxt] = cur
+                if nxt in goals:
+                    path = [nxt]
+                    while True:
+                        p = prev[path[-1]]
+                        if p is None: break
+                        path.append(p)
+                    path.reverse()
+                    return path
+                q.append(nxt)
+        return None
+
+    def _bfs_tree(self, start: str) -> Tuple[Dict[str, int], Dict[str, Optional[str]]]:
+        from collections import deque
+        adj = self._adj_cells()
+        dist: Dict[str, int] = {start: 0}
+        prev: Dict[str, Optional[str]] = {start: None}
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            for nxt in adj.get(cur, []):
+                if nxt in dist: continue
+                dist[nxt] = dist[cur] + 1
+                prev[nxt] = cur
+                q.append(nxt)
+        return dist, prev
+
+    def _edge_action_between(self, src: str, dst: str) -> Optional[str]:
+        for e in self.kg.edges.values():
+            if e.rel == "move" and e.source == src and e.target == dst and e.action:
+                return e.action
+        return None
+
+    def _choose_action_from_plan(self, plan: List[str]) -> Optional[str]:
+        if len(plan) < 2: return None
+        src, dst = plan[0], plan[1]
+        for e in self.kg.edges.values():
+            if e.rel == "move" and e.source == src and e.target == dst and e.action:
+                return e.action
+        return None
+
+    def _step_into_unknown(self, avoid_dir: Optional[str]) -> Optional[str]:
+        a = self.agent
+        obs = self.maze.observe_cell(a.x, a.y)
+        open_dirs = list(obs["open_dirs"])
+        candidates = []
+        for d in open_dirs:
+            if avoid_dir and d == avoid_dir: continue
+            dx, dy, _, _ = DIRS[d]
+            nx, ny = a.x + dx, a.y + dy
+            nnid = self.kg.cell_id(nx, ny)
+            if nnid not in self.kg.nodes:
+                candidates.append(d)
+        if candidates: return random.choice(candidates)
+        if avoid_dir:
+            non = [d for d in open_dirs if d != avoid_dir]
+            if non: return random.choice(non)
+        return random.choice(open_dirs) if open_dirs else None
+
+    def _resource_targets(self, rtype: str) -> Set[str]:
+        goals = set()
+        for nid, n in self.kg.nodes.items():
+            if n.kind == "object" and rtype in (n.tags or []) and "consumed" not in (n.tags or []):
+                if nid.startswith(f"obj:{rtype}:"):
+                    coord = nid.split(":")[-1]
+                    goals.add("cell:" + coord)
+        return goals
+
+    def _consume_if_present(self):
+        a = self.agent
+        step = a.steps
+        p = (a.x, a.y)
+        item = self.maze.items.get(p)
+        if not item: return
+
+        t = item["type"]
+        if t == "food":
+            amt = int(item.get("amount", 28))
+            a.energy = min(180, a.energy + amt)
+            self._log_event("consume", "Ate food", {"amount": int(amt), "pos": [int(a.x), int(a.y)]})
+            delay = self.rng.randint(self.food_respawn_min, self.food_respawn_max)
+            resp_amt = self.rng.randint(22, 34)
+            self.respawn_queue.append({"pos": [a.x, a.y], "due_step": a.steps + delay, "amount": resp_amt})
+
+        elif t == "oil":
+            amt = int(item.get("amount", 12))
+            a.oil = min(16, a.oil + amt)
+            self._log_event("consume", "Refilled oil", {"amount": int(amt), "pos": [int(a.x), int(a.y)]})
+        
+        elif t == "weapon":
+            lvl = int(item.get("level", 1))
+            name = item.get("name", "Weapon")
+            if lvl > a.weapon_power:
+                a.weapon_power = lvl
+                self._log_event("equip", f"Equipped {name} (+{lvl})")
+            else:
+                self._log_event("ignore", f"Found {name} but have better")
+
+        elif t == "rubble":
+            return
+
+        if t in ("food", "oil", "weapon"):
+            oid = self.kg.obj_id(t, a.x, a.y)
+            if oid in self.kg.nodes:
+                n = self.kg.nodes[oid]
+                if "consumed" not in n.tags:
+                    n.tags.append("consumed")
+                n.attrs["consumed_step"] = step
+                self.kg.bump_edge(self.kg.agent_id(), oid, "collected", None, "traversed", step)
+                self.kg.touch_node(oid, step, used=True)
+            del self.maze.items[p]
+
+    def _rebuild_regions(self):
+        step = self.agent.steps
+        self.kg.remove_nodes_by_kind("region")
+        adj = self._adj_cells()
+        cells = [nid for nid, n in self.kg.nodes.items() if n.kind == "cell"]
+        deg = {nid: len(set(adj.get(nid, []))) for nid in cells}
+        def rtype_for(nid: str) -> str:
+            return "room" if deg.get(nid, 0) >= 3 else "corridor"
+        visited = set()
+        regions: List[Tuple[str, List[str]]] = []
+        for nid in cells:
+            if nid in visited: continue
+            rt = rtype_for(nid)
+            stack = [nid]
+            comp = []
+            visited.add(nid)
+            while stack:
+                cur = stack.pop()
+                comp.append(cur)
+                for nxt in adj.get(cur, []):
+                    if nxt in visited: continue
+                    if rtype_for(nxt) == rt:
+                        visited.add(nxt)
+                        stack.append(nxt)
+            regions.append((rt, comp))
+        cell_to_region: Dict[str, str] = {}
+        for idx, (rt, members) in enumerate(regions):
+            xs, ys = [], []
+            for m in members:
+                n = self.kg.nodes.get(m)
+                if n:
+                    xs.append(n.x)
+                    ys.append(n.y)
+            if not xs: continue
+            cx = sum(xs) / len(xs)
+            cy = sum(ys) / len(ys)
+            rid = self.kg.region_id(rt, idx)
+            rn = self.kg.ensure_node(rid, "region", cx, cy, step)
+            rn.tags = [rt, "meta"]
+            rn.attrs["size"] = len(members)
+            self.kg.touch_node(rid, step, used=False)
+            for m in members:
+                cell_to_region[m] = rid
+                self.kg.bump_edge(m, rid, "in_region", None, "observed", step)
+                self.kg.bump_edge(rid, m, "contains", None, "observed", step)
+        seen_pairs = set()
+        for e in list(self.kg.edges.values()):
+            if e.rel != "move": continue
+            s, t = e.source, e.target
+            rs = cell_to_region.get(s)
+            rt = cell_to_region.get(t)
+            if rs and rt and rs != rt:
+                pair = tuple(sorted((rs, rt)))
+                if pair in seen_pairs: continue
+                seen_pairs.add(pair)
+                self.kg.bump_edge(rs, rt, "connects", None, "observed", step)
+                self.kg.bump_edge(rt, rs, "connects", None, "observed", step)
+
+    def llm_state(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.llm_enabled),
+            "model": self.ollama_model,
+            "host": self.ollama_host,
+            "checkin_every": int(self.llm_checkin_every),
+            "allow_model_choose_next": bool(self.llm_allow_choose_next),
+            "steps_until_checkin": int(self.llm_steps_until_checkin),
+            "current_lens": self.llm_current_lens or "auto",
+            "target_cell": self.llm_target_cell or "",
+            "last_error": self.llm_last_error or "",
+            # Reflection system state
+            "reflection_enabled": bool(self.reflection_enabled),
+            "last_was_reflection": bool(self.last_was_reflection),
+            "can_reflect": bool(self.reflection_enabled and not self.last_was_reflection),
+        }
+
+    def _log_event(self, kind: str, desc: str, data: Optional[Dict[str, Any]] = None):
+        ev = {"step": int(self.agent.steps), "kind": kind, "desc": desc, "data": data or {}}
+        self.event_log.append(ev)
+        if len(self.event_log) > 60:
+            self.event_log = self.event_log[-60:]
+
+    def _legal_moves_now(self) -> List[str]:
+        a = self.agent
+        moves = []
+        for d in ("N", "E", "S", "W"):
+            if self.maze.can_move(a.x, a.y, d):
+                moves.append(d)
+        return moves
+
+    def _infer_mission(self) -> Dict[str, Any]:
+        a = self.agent
+        if a.escaped: stage = "DONE"
+        elif a.has_key: stage = "REACH_EXIT"
+        else: stage = "FIND_KEY"
+        key_cells = []
+        exit_cells = []
+        for n in self.kg.nodes.values():
+            if n.kind != "cell": continue
+            if "key" in (n.tags or []):
+                key_cells.append({"id": n.id, "pos": [int(n.x), int(n.y)]})
+            if "exit" in (n.tags or []):
+                exit_cells.append({"id": n.id, "pos": [int(n.x), int(n.y)]})
+        return {
+            "stage": stage,
+            "known_key_cells": key_cells,
+            "known_exit_cells": exit_cells,
+            "has_key": bool(a.has_key),
+        }
+
+    def _los_minimap(self, radius: int = 4) -> str:
+        a = self.agent
+        vis = set(self.visible or set())
+        out = []
+        for dy in range(-radius, radius + 1):
+            row = []
+            for dx in range(-radius, radius + 1):
+                x = a.x + dx
+                y = a.y + dy
+                if not in_bounds(x, y, self.maze.w, self.maze.h):
+                    row.append("#")
+                    continue
+                if dx == 0 and dy == 0:
+                    row.append("A")
+                    continue
+
+                nid = self.kg.cell_id(x, y)
+                node = self.kg.nodes.get(nid)
+                is_known = node is not None
+                is_vis = (x, y) in vis
+                
+                monster_char = None
+                for m in self.maze.monsters:
+                    if m.x == x and m.y == y and is_vis:
+                        monster_char = "M"
+                        break
+                
+                if monster_char:
+                    row.append(monster_char)
+                    continue
+
+                ch = " "
+                if is_vis or is_known:
+                    if is_vis:
+                        tags = set(node.tags or []) if node else set()
+                        if "key" in tags: ch = "K"
+                        elif "exit" in tags: ch = "X"
+                        else:
+                            item = self.maze.items.get((x, y))
+                            if item:
+                                t = item.get("type")
+                                if t == "food": ch = "F"
+                                elif t == "oil": ch = "O"
+                                elif t == "rubble": ch = "R"
+                                elif t == "weapon": ch = "W"
+                                else: ch = "v"
+                            else:
+                                ch = "."
+                    else:
+                        ch = "#" if "blocked_dirs" in (node.attrs or {}) else "."
+                else:
+                    ch = " "
+                row.append(ch)
+            out.append("".join(row))
+        return "\n".join(out)
+
+    def _get_cell_content_from_kg(self, x: int, y: int, include_details: bool = True) -> str:
+        """
+        Get cell content based ONLY on what's in the KG (what agent has discovered).
+        
+        Returns content string based on:
+        1. Currently visible cells (in self.visible) - can see monsters, current items
+        2. KG-recorded information - key/exit tags, known objects
+        
+        This ensures the AI only "knows" what it has actually discovered.
+        """
+        vis = self.visible or set()
+        is_visible = (x, y) in vis
+        
+        # Check KG for this cell
+        cell_id = self.kg.cell_id(x, y)
+        cell_node = self.kg.nodes.get(cell_id)
+        
+        # If cell not in KG at all, it's unexplored
+        if cell_node is None:
+            return "unexplored"
+        
+        cell_tags = set(cell_node.tags or [])
+        
+        # Priority 1: Monsters (only if currently visible - monsters move!)
+        if is_visible:
+            mob = next((m for m in self.maze.monsters if m.x == x and m.y == y), None)
+            if mob:
+                if include_details:
+                    return f"Monster({mob.kind},L{mob.level},HP:{mob.hp}/{mob.max_hp})"
+                else:
+                    return f"Monster({mob.kind})"
+        
+        # Priority 2: Key/Exit from KG tags (persistent knowledge)
+        if "key" in cell_tags:
+            return "KEY"
+        if "exit" in cell_tags:
+            return "EXIT"
+        
+        # Priority 3: Items - check KG object nodes at this location
+        # Only show items that are in KG and not consumed
+        for n in self.kg.nodes.values():
+            if n.kind == "object" and int(n.x) == x and int(n.y) == y:
+                if "consumed" not in (n.tags or []):
+                    obj_type = n.attrs.get("type", "item")
+                    if include_details:
+                        amt = n.attrs.get("amount", "")
+                        return f"{obj_type.capitalize()}({amt})" if amt else obj_type.capitalize()
+                    else:
+                        return obj_type.capitalize()
+        
+        # Cell is known but empty
+        return "empty"
+
+    def _los_minimap_v2(self) -> Dict[str, Any]:
+        """
+        Calculates structured spatial awareness data including flanks and diagonals.
+        
+        IMPORTANT: This now uses KG data only - the agent can only "see" what it has
+        discovered and recorded in the Knowledge Graph. This prevents cheating by
+        accessing ground truth maze data directly.
+        
+        Visibility rules:
+        - Monsters: Only shown if currently in line-of-sight (they move!)
+        - Key/Exit: Shown if cell has been explored and tagged in KG
+        - Items: Shown if recorded in KG as object nodes (not consumed)
+        - Walls: Based on actual maze geometry (agent can feel walls)
+        """
+        a = self.agent
+        vision = max(1, int(a.oil))
+        if a.oil >= 4:
+            vision = 6
+        
+        # 1. Standing on - use KG-based lookup for current position
+        standing_on_content = self._get_cell_content_from_kg(a.x, a.y, include_details=True)
+        standing_on = []
+        if standing_on_content and standing_on_content not in ("empty", "unexplored"):
+            standing_on.append(standing_on_content)
+        
+        # 2. Rays - cast in each cardinal direction
+        rays = {}
+        for dname, (dx, dy, wall_here, _) in DIRS.items():
+            ray_steps = []
+            cx, cy = a.x, a.y
+            blocked = False
+            
+            # Determine Left/Right relative to direction
+            left_map = {"N": "W", "E": "N", "S": "E", "W": "S"}
+            right_map = {"N": "E", "E": "S", "S": "W", "W": "N"}
+            
+            lname = left_map[dname]
+            rname = right_map[dname]
+            
+            for i in range(1, vision + 1):
+                # Wall check - agent can feel walls (this is allowed)
+                if not self.maze.can_move(cx, cy, dname):
+                    blocked = True
+                    break
+                
+                cx, cy = cx + dx, cy + dy
+                
+                # Get content from KG (not ground truth!)
+                content = self._get_cell_content_from_kg(cx, cy, include_details=True)
+
+                # Check flanks
+                flanks = {}
+                
+                # Left Flank
+                if not self.maze.can_move(cx, cy, lname):
+                    flanks[lname] = "wall"
+                else:
+                    ldx, ldy, _, _ = DIRS[lname]
+                    lx, ly = cx + ldx, cy + ldy
+                    peek = self._get_cell_content_from_kg(lx, ly, include_details=False)
+                    flanks[lname] = f"OPEN->({lx},{ly}):{peek}"
+
+                # Right Flank
+                if not self.maze.can_move(cx, cy, rname):
+                    flanks[rname] = "wall"
+                else:
+                    rdx, rdy, _, _ = DIRS[rname]
+                    rx, ry = cx + rdx, cy + rdy
+                    peek = self._get_cell_content_from_kg(rx, ry, include_details=False)
+                    flanks[rname] = f"OPEN->({rx},{ry}):{peek}"
+                
+                ray_steps.append({
+                    "pos": (cx, cy),
+                    "dist": i,
+                    "content": content,
+                    "flanks": flanks
+                })
+            
+            rays[dname] = {"blocked": blocked, "steps": ray_steps}
+
+        # 3. Diagonals (L-shaped paths to adjacent diagonal cells)
+        diagonals = {}
+        diag_map = {
+            "NE": ("N", "E", 1, -1),
+            "NW": ("N", "W", -1, -1),
+            "SE": ("S", "E", 1, 1),
+            "SW": ("S", "W", -1, 1)
+        }
+        
+        for diag_name, (d1, d2, ddx, ddy) in diag_map.items():
+            tx, ty = a.x + ddx, a.y + ddy
+            path = None
+            if in_bounds(tx, ty, self.maze.w, self.maze.h):
+                # Try via d1 then d2
+                p1_open = self.maze.can_move(a.x, a.y, d1)
+                d1x, d1y, _, _ = DIRS[d1]
+                p1_step2 = self.maze.can_move(a.x + d1x, a.y + d1y, d2) if p1_open else False
+                
+                # Try via d2 then d1
+                p2_open = self.maze.can_move(a.x, a.y, d2)
+                d2x, d2y, _, _ = DIRS[d2]
+                p2_step2 = self.maze.can_move(a.x + d2x, a.y + d2y, d1) if p2_open else False
+                
+                if (p1_open and p1_step2):
+                    path = f"via {d1}->{d2}"
+                elif (p2_open and p2_step2):
+                    path = f"via {d2}->{d1}"
+                
+                if path:
+                    # Get content from KG (not ground truth!)
+                    content = self._get_cell_content_from_kg(tx, ty, include_details=False)
+                    diagonals[diag_name] = f"({tx},{ty}) {path} -> {content}"
+                else:
+                    diagonals[diag_name] = "blocked"
+            else:
+                diagonals[diag_name] = "out_of_bounds"
+
+        return {
+            "pos": (a.x, a.y),
+            "oil": a.oil,
+            "vision": vision,
+            "standing_on": standing_on,
+            "rays": rays,
+            "diagonals": diagonals
+        }
+
+    def _format_spatial_awareness(self) -> str:
+        """
+        Format spatial awareness data as human-readable text for the LLM.
+        
+        Content values explained:
+        - empty: Cell explored but nothing there
+        - unexplored: Cell not yet visited/recorded in KG
+        - KEY/EXIT: Discovered objective locations
+        - Food/Oil/Weapon/Rubble: Discovered items (from KG, not consumed)
+        - Monster(...): Currently visible monster (monsters move, so only shown when in sight)
+        """
+        data = self._los_minimap_v2()
+        lines = []
+        lines.append("═══════════════════════════════════════════════════════════════")
+        lines.append(f"SPATIAL AWARENESS @ {data['pos']} | Oil: {data['oil']} | Vision: {data['vision']} tiles")
+        lines.append("(Based on Knowledge Graph - shows only what you have discovered)")
+        if data['standing_on']:
+             lines.append(f"Standing on: {', '.join(data['standing_on'])}")
+        else:
+             lines.append("Standing on: (floor)")
+        lines.append("═══════════════════════════════════════════════════════════════")
+        
+        for dname in ["N", "E", "S", "W"]:
+             info = data['rays'][dname]
+             status = "open - can move" if (info['steps'] or not info['blocked']) else "WALL - blocked"
+             if not info['steps'] and info['blocked']: status = "WALL - blocked"
+             
+             lines.append(f"\n── {dname} [{status}] ──")
+             if not info['steps'] and info['blocked']:
+                 lines.append(f"   (wall at your position)")
+             
+             for s in info['steps']:
+                 x, y = s['pos']
+                 left_k = list(s['flanks'].keys())[0] 
+                 right_k = list(s['flanks'].keys())[1] 
+                 l_val = s['flanks'][left_k]
+                 r_val = s['flanks'][right_k]
+                 
+                 lines.append(f"   ({x},{y}): {s['content']:<14} │ {left_k}:{l_val}  {right_k}:{r_val} │")
+             
+             if info['blocked']:
+                 if info['steps']: lines.append("   ─── wall blocks further ───")
+             else:
+                 lines.append("   ─── end of vision ───")
+
+        lines.append("\n── DIAGONALS ──")
+        for k, v in data['diagonals'].items():
+            lines.append(f"   {k}: {v}")
+        
+        lines.append("\n── LEGEND ──")
+        lines.append("   empty=explored/nothing | unexplored=not yet visited | Monster=currently visible threat")
+            
+        return "\n".join(lines)
+
+    def _build_move_summaries(self, count: int = 2) -> List[Dict[str, Any]]:
+        """Build detailed summaries of recent moves for LLM awareness."""
+        summaries = []
+        history = self.move_history[-count:] if self.move_history else []
+        
+        for move in history:
+            summary = {
+                "step": move.get("step", 0),
+                "action": move.get("action", "?"),
+                "from_pos": move.get("from_pos", [0, 0]),
+                "to_pos": move.get("to_pos", [0, 0]),
+                "events": move.get("events", []),
+                "hp_change": move.get("hp_change", 0),
+                "oil_change": move.get("oil_change", 0),
+                "narrative": move.get("narrative", ""),
+            }
+            summaries.append(summary)
+        
+        return summaries
+
+    def _record_move(self, action: str, from_pos: Tuple[int, int], to_pos: Tuple[int, int], 
+                     events: List[str], hp_change: int = 0, oil_change: int = 0):
+        """Record a detailed move for history tracking."""
+        # Build narrative - handle attack actions differently
+        if action.startswith("attack_"):
+            direction = action.replace("attack_", "")
+            parts = [f"Attacked {direction} from {from_pos} (stayed in place)"]
+        elif from_pos == to_pos:
+            parts = [f"Stayed at {from_pos}"]
+        else:
+            parts = [f"Moved {action} from {from_pos} to {to_pos}"]
+        
+        if events:
+            parts.append(f"({', '.join(events)})")
+        if hp_change != 0:
+            parts.append(f"HP {'+' if hp_change > 0 else ''}{hp_change}")
+        if oil_change != 0:
+            parts.append(f"Oil {'+' if oil_change > 0 else ''}{oil_change}")
+        
+        record = {
+            "step": self.agent.steps,
+            "action": action,
+            "from_pos": list(from_pos),
+            "to_pos": list(to_pos),
+            "events": events,
+            "hp_change": hp_change,
+            "oil_change": oil_change,
+            "narrative": " | ".join(parts),
+        }
+        
+        self.move_history.append(record)
+        if len(self.move_history) > self.max_move_history:
+            self.move_history = self.move_history[-self.max_move_history:]
+
+    def reflection_query(self, query: str, query_type: str = "general") -> Dict[str, Any]:
+        """
+        Process a reflection query from the LLM. This allows the agent to query
+        the KG without consuming resources.
+        
+        Query types:
+        - "location": Find where something is (key, exit, food, oil, etc.)
+        - "history": Get recent move/event history  
+        - "path": Check if path exists to a target
+        - "status": Get agent status summary
+        - "danger": Check for nearby threats
+        - "general": Free-form KG search
+        
+        Returns query results without consuming energy or oil.
+        """
+        a = self.agent
+        result = {
+            "query": query,
+            "query_type": query_type,
+            "success": True,
+            "data": {},
+            "narrative": "",
+        }
+        
+        q_lower = query.lower().strip()
+        
+        # Location queries
+        if query_type == "location" or any(w in q_lower for w in ["where", "location", "find"]):
+            targets = {}
+            
+            # Check for key
+            if "key" in q_lower:
+                key_nodes = [n for n in self.kg.nodes.values() if n.kind == "cell" and "key" in (n.tags or [])]
+                if key_nodes:
+                    targets["key"] = {"pos": [int(key_nodes[0].x), int(key_nodes[0].y)], "known": True}
+                else:
+                    targets["key"] = {"pos": None, "known": False}
+            
+            # Check for exit
+            if "exit" in q_lower:
+                exit_nodes = [n for n in self.kg.nodes.values() if n.kind == "cell" and "exit" in (n.tags or [])]
+                if exit_nodes:
+                    targets["exit"] = {"pos": [int(exit_nodes[0].x), int(exit_nodes[0].y)], "known": True}
+                else:
+                    targets["exit"] = {"pos": None, "known": False}
+            
+            # Check for food
+            if "food" in q_lower:
+                food_nodes = [n for n in self.kg.nodes.values() if n.kind == "object" and "food" in (n.tags or []) and "consumed" not in (n.tags or [])]
+                targets["food"] = [{"pos": [int(n.x), int(n.y)]} for n in food_nodes[:5]]
+            
+            # Check for oil
+            if "oil" in q_lower:
+                oil_nodes = [n for n in self.kg.nodes.values() if n.kind == "object" and "oil" in (n.tags or []) and "consumed" not in (n.tags or [])]
+                targets["oil"] = [{"pos": [int(n.x), int(n.y)]} for n in oil_nodes[:5]]
+            
+            # Check for monsters
+            if "monster" in q_lower or "danger" in q_lower:
+                monster_nodes = [n for n in self.kg.nodes.values() if n.kind == "monster"]
+                targets["monsters"] = [{"id": n.id, "pos": [int(n.x), int(n.y)], "kind": n.attrs.get("kind")} for n in monster_nodes]
+            
+            result["data"]["locations"] = targets
+            result["narrative"] = f"Location query results: {len(targets)} target types found"
+        
+        # History queries
+        elif query_type == "history" or any(w in q_lower for w in ["history", "recent", "last", "previous"]):
+            result["data"]["recent_moves"] = self._build_move_summaries(5)
+            result["data"]["recent_events"] = list(self.event_log[-8:])
+            result["narrative"] = f"History: {len(self.move_history)} moves recorded, {len(self.event_log)} events"
+        
+        # Path queries  
+        elif query_type == "path" or any(w in q_lower for w in ["path", "route", "reach", "get to"]):
+            cur_cell = self.kg.cell_id(a.x, a.y)
+            
+            # Try to determine target from query
+            target_cell = None
+            if "key" in q_lower:
+                key_nodes = [n for n in self.kg.nodes.values() if n.kind == "cell" and "key" in (n.tags or [])]
+                if key_nodes:
+                    target_cell = key_nodes[0].id
+            elif "exit" in q_lower:
+                exit_nodes = [n for n in self.kg.nodes.values() if n.kind == "cell" and "exit" in (n.tags or [])]
+                if exit_nodes:
+                    target_cell = exit_nodes[0].id
+            elif "food" in q_lower:
+                food_cells = self._resource_targets("food")
+                if food_cells:
+                    target_cell = list(food_cells)[0]
+            elif "oil" in q_lower:
+                oil_cells = self._resource_targets("oil")
+                if oil_cells:
+                    target_cell = list(oil_cells)[0]
+            
+            if target_cell:
+                path = self._bfs_path(cur_cell, {target_cell})
+                if path:
+                    result["data"]["path_exists"] = True
+                    result["data"]["path_length"] = len(path) - 1
+                    result["data"]["path"] = path[:10]  # First 10 steps
+                    result["narrative"] = f"Path found: {len(path)-1} steps to target"
+                else:
+                    result["data"]["path_exists"] = False
+                    result["narrative"] = "No known path to target"
+            else:
+                result["data"]["path_exists"] = None
+                result["narrative"] = "Target not found in knowledge graph"
+        
+        # Status queries
+        elif query_type == "status" or any(w in q_lower for w in ["status", "health", "hp", "energy"]):
+            result["data"]["status"] = {
+                "pos": [int(a.x), int(a.y)],
+                "hp": int(a.energy),
+                "hp_status": "CRITICAL" if a.energy <= 10 else ("LOW" if a.energy <= 25 else "OK"),
+                "oil": int(a.oil),
+                "oil_status": "CRITICAL" if a.oil <= 1 else ("LOW" if a.oil <= 3 else "OK"),
+                "has_key": bool(a.has_key),
+                "weapon_power": int(a.weapon_power),
+                "steps": int(a.steps),
+                "mode": str(a.mode),
+            }
+            result["narrative"] = f"Agent at {a.x},{a.y} | HP={a.energy} Oil={a.oil} Key={a.has_key}"
+        
+        # Danger assessment
+        elif query_type == "danger" or any(w in q_lower for w in ["danger", "threat", "safe"]):
+            visible_monsters = []
+            for m in self.maze.monsters:
+                if (m.x, m.y) in self.visible:
+                    dist = abs(m.x - a.x) + abs(m.y - a.y)
+                    visible_monsters.append({
+                        "kind": m.kind,
+                        "pos": [int(m.x), int(m.y)],
+                        "distance": dist,
+                        "hp": int(m.hp),
+                        "damage": int(m.damage),
+                        "adjacent": dist == 1,
+                    })
+            
+            result["data"]["threats"] = visible_monsters
+            result["data"]["threat_level"] = "HIGH" if any(m["adjacent"] for m in visible_monsters) else ("MEDIUM" if visible_monsters else "LOW")
+            result["narrative"] = f"Threats: {len(visible_monsters)} monsters visible, threat level {result['data']['threat_level']}"
+        
+        # General KG search (fallback)
+        else:
+            nodes = []
+            for n in self.kg.nodes.values():
+                blob = " ".join([n.id, n.kind, " ".join(n.tags or [])]).lower()
+                if q_lower in blob:
+                    nodes.append({"id": n.id, "kind": n.kind, "tags": n.tags, "pos": [n.x, n.y]})
+            
+            memories = []
+            for m in self.kg.memories.values():
+                if q_lower in m.text.lower() or any(q_lower in t.lower() for t in (m.context_tags or [])):
+                    memories.append({"id": m.id, "text": m.text[:100], "importance": m.importance})
+            
+            result["data"]["nodes"] = nodes[:10]
+            result["data"]["memories"] = memories[:5]
+            result["narrative"] = f"Found {len(nodes)} nodes and {len(memories)} memories matching '{query}'"
+        
+        # Record this reflection
+        reflection_record = {
+            "step": a.steps,
+            "query": query,
+            "query_type": query_type,
+            "result_summary": result["narrative"],
+        }
+        self.reflection_history.append(reflection_record)
+        if len(self.reflection_history) > self.max_reflection_history:
+            self.reflection_history = self.reflection_history[-self.max_reflection_history:]
+        
+        return result
+
+    def _build_current_context_tags(self) -> List[str]:
+        a = self.agent
+        cur_cell = self.kg.cell_id(a.x, a.y)
+        context = set()
+        context.add(a.mode)
+        if a.has_key: context.add("has_key")
+        if a.energy <= 25: context.add("low_hp")
+        if a.energy <= 10: context.add("critical_hp")
+        if a.oil <= 3: context.add("low_oil")
+        if a.oil <= 1: context.add("critical_oil")
+        
+        cur_node = self.kg.nodes.get(cur_cell)
+        if cur_node and cur_node.tags:
+            context.update(cur_node.tags)
+        
+        for m in self.maze.monsters:
+            if (m.x, m.y) in self.visible:
+                context.add("monster_visible")
+                context.add(f"monster_{m.kind}")
+        
+        for (vx, vy) in self.visible:
+            vnode = self.kg.nodes.get(self.kg.cell_id(vx, vy))
+            if vnode:
+                for tag in (vnode.tags or []):
+                    if tag in ("key", "exit", "food", "oil", "weapon", "rubble"):
+                        context.add(f"near_{tag}")
+        return list(context)
+
+    def _build_llm_bundle(self, max_visible: int = 60) -> Dict[str, Any]:
+        a = self.agent
+        cur_cell = self.kg.cell_id(a.x, a.y)
+        dist_map, _prev = self._bfs_tree(cur_cell)
+
+        food_targets = self._resource_targets("food")
+        oil_targets = self._resource_targets("oil")
+        key_cells = [n for n in self.kg.nodes.values() if n.kind == "cell" and "key" in (n.tags or [])]
+        exit_cells = [n for n in self.kg.nodes.values() if n.kind == "cell" and "exit" in (n.tags or [])]
+        frontiers = [n for n in self.kg.nodes.values() if n.kind == "cell" and n.frontier]
+        
+        nearest_food_dist = min((dist_map.get(t, 9999) for t in food_targets), default=None)
+        nearest_oil_dist = min((dist_map.get(t, 9999) for t in oil_targets), default=None)
+        nearest_key_dist = min((dist_map.get(self.kg.cell_id(int(n.x), int(n.y)), 9999) for n in key_cells), default=None)
+        nearest_exit_dist = min((dist_map.get(self.kg.cell_id(int(n.x), int(n.y)), 9999) for n in exit_cells), default=None)
+        nearest_frontier_dist = min((dist_map.get(n.id, 9999) for n in frontiers), default=None)
+
+        toolbox = {
+            "_README": "KG PROCESSES. Pick one. You are the ego-syntonic subconscious.",
+            "lenses": {
+                "explore": {
+                    "description": "KG pathfinds to nearest frontier cell to expand the known map",
+                    "status": "READY" if frontiers else "NO_FRONTIERS",
+                    "frontier_count": len(frontiers),
+                    "nearest_frontier_dist": nearest_frontier_dist if nearest_frontier_dist and nearest_frontier_dist < 9999 else None,
+                },
+                "to_food": {
+                    "description": "KG pathfinds to nearest known food source to restore energy",
+                    "status": "READY" if food_targets else "NO_FOOD_KNOWN",
+                    "known_food_count": len(food_targets),
+                    "nearest_food_dist": nearest_food_dist if nearest_food_dist and nearest_food_dist < 9999 else None,
+                },
+                "to_oil": {
+                    "description": "KG pathfinds to nearest known oil source to restore vision",
+                    "status": "READY" if oil_targets else "NO_OIL_KNOWN",
+                    "known_oil_count": len(oil_targets),
+                    "nearest_oil_dist": nearest_oil_dist if nearest_oil_dist and nearest_oil_dist < 9999 else None,
+                },
+                "find_key": {
+                    "description": "KG pathfinds toward the key (if known) or explores to find it",
+                    "status": "HAVE_KEY" if a.has_key else ("KEY_KNOWN" if key_cells else "KEY_UNKNOWN"),
+                    "key_location": [int(key_cells[0].x), int(key_cells[0].y)] if key_cells else None,
+                    "dist_to_key": nearest_key_dist if nearest_key_dist and nearest_key_dist < 9999 else None,
+                },
+                "hunt_exit": {
+                    "description": "KG pathfinds to exit (only useful after obtaining key)",
+                    "status": "READY" if (a.has_key and exit_cells) else ("NEED_KEY" if not a.has_key else "EXIT_UNKNOWN"),
+                    "exit_location": [int(exit_cells[0].x), int(exit_cells[0].y)] if exit_cells else None,
+                    "dist_to_exit": nearest_exit_dist if nearest_exit_dist and nearest_exit_dist < 9999 else None,
+                },
+                "to_target": {
+                    "description": "KG pathfinds to a specific cell you provide via target_cell parameter",
+                    "status": "READY",
+                    "usage": "Set target_cell to 'cell:X,Y' or [X,Y] coordinates",
+                },
+                "auto": {
+                    "description": "KG uses heuristics: low_energy→food, low_oil→oil, has_key→exit, else→explore",
+                    "status": "READY",
+                    "current_heuristic_choice": a.mode,
+                },
+            },
+            "tools": {
+                "annotate": {
+                    "description": "Add semantic tags to nodes. Use to mark danger, interest, or strategy.",
+                    "usage": "[[annotate]] {'node_id': 'cell:X,Y', 'tags': ['danger', 'chokepoint'], 'note': 'Monster sighted'}"
+                },
+                "observe": {
+                    "description": "Store an observation/memory with importance for future retrieval. Memories are searched by importance AND relevance to current context.",
+                    "usage": "[[observe]] {'text': 'description', 'importance': 0.7, 'tags': ['tactical', 'danger', 'resource']}",
+                    "importance_guide": "0.9-1.0=critical, 0.6-0.8=important, 0.3-0.5=useful, 0.1-0.2=minor",
+                }
+            },
+            "override_action": {
+                "description": "RARELY USE. Directly move N/E/S/W for one step, bypassing KG pathfinding",
+                "legal_moves": self._legal_moves_now(),
+                "when_to_use": "Only when KG is stuck or you see something KG missed",
+            },
+        }
+
+        agent_state = {
+            "pos": [int(a.x), int(a.y)],
+            "hp": int(a.energy),
+            "hp_status": "CRITICAL" if a.energy <= 10 else ("LOW" if a.energy <= 25 else "OK"),
+            "oil": int(a.oil),
+            "oil_status": "CRITICAL" if a.oil <= 1 else ("LOW" if a.oil <= 3 else "OK"),
+            "weapon_power": int(a.weapon_power),
+            "base_damage": 1 + a.weapon_power,
+            "vision_range": max(1, a.oil),
+            "has_key": bool(a.has_key),
+            "current_lens": str(a.mode),
+            "steps_taken": int(a.steps),
+        }
+
+        if a.escaped: mission_stage = "COMPLETE"
+        elif a.has_key: mission_stage = "REACH_EXIT"
+        else: mission_stage = "FIND_KEY"
+
+        mission = {
+            "stage": mission_stage,
+            "objective": {
+                "FIND_KEY": "Locate and collect the key",
+                "REACH_EXIT": "Navigate to the exit to escape",
+                "COMPLETE": "Mission accomplished!",
+            }.get(mission_stage, "Unknown"),
+            "has_key": bool(a.has_key),
+            "key_known": bool(key_cells),
+            "exit_known": bool(exit_cells),
+        }
+
+        vis_cells = sorted(list(self.visible or set()))
+        visible_summary = []
+        visible_monsters = []
+        for (vx, vy) in vis_cells[:max_visible]:
+            obs = self.maze.observe_cell(vx, vy)
+            item = obs.get("item")
+            monster = obs.get("monster")
+            visible_summary.append({
+                "pos": [int(vx), int(vy)],
+                "open_dirs": list(obs.get("open_dirs", [])),
+                "key_here": bool(obs.get("has_key_here")),
+                "exit_here": bool(obs.get("has_exit_here")),
+                "item": item if item else None,
+                "monster": monster if monster else None,
+            })
+            if monster:
+                visible_monsters.append(monster)
+
+        objs = []
+        for n in self.kg.nodes.values():
+            if n.kind == "object" and "consumed" not in (n.tags or []):
+                obj_cell = f"cell:{int(n.x)},{int(n.y)}"
+                objs.append({
+                    "type": n.attrs.get("type"),
+                    "amount": n.attrs.get("amount"),
+                    "level": n.attrs.get("level"),
+                    "pos": [int(n.x), int(n.y)],
+                    "dist": dist_map.get(obj_cell) if obj_cell in dist_map else None,
+                })
+        objs = sorted(objs, key=lambda x: (x.get("dist") or 9999))[:30]
+
+        frontier_list = []
+        for n in frontiers:
+            d = dist_map.get(n.id)
+            frontier_list.append({"pos": [int(n.x), int(n.y)], "dist": d})
+        frontier_list = sorted(frontier_list, key=lambda x: (x.get("dist") or 9999))[:12]
+
+        current_context = self._build_current_context_tags()
+        relevant_memories = self.kg.search_memories(
+            current_context_tags=current_context,
+            top_k=5,
+            min_importance=0.2,
+            step=a.steps
+        )
+
+        memories_for_bundle = []
+        for mem, score in relevant_memories:
+            memories_for_bundle.append({
+                "id": mem.id,
+                "text": mem.text,
+                "importance": mem.importance,
+                "relevance_score": round(score, 3),
+                "tags": mem.context_tags,
+                "age_steps": a.steps - mem.step_created,
+            })
+
+        top_importance_memories = self.kg.search_memories_by_importance(top_k=3, min_importance=0.7)
+        high_importance_for_bundle = []
+        for mem in top_importance_memories:
+            if mem.id not in [m["id"] for m in memories_for_bundle]:
+                high_importance_for_bundle.append({
+                    "id": mem.id,
+                    "text": mem.text,
+                    "importance": mem.importance,
+                    "tags": mem.context_tags,
+                    "age_steps": a.steps - mem.step_created,
+                })
+
+        kg_summary = {
+            "cells_explored": int(sum(1 for n in self.kg.nodes.values() if n.kind == "cell")),
+            "frontier_count": len(frontiers),
+            "nearest_frontiers": frontier_list,
+            "known_resources": objs,
+            "visible_monsters": visible_monsters,
+            "spatial_awareness": self._format_spatial_awareness(),  # KG-based spatial awareness (replaces minimap)
+            "relevant_memories": memories_for_bundle,
+            "high_importance_memories": high_importance_for_bundle,
+            "total_memories": len(self.kg.memories),
+            "current_context_tags": current_context,
+        }
+
+        # Build detailed move summaries for last 2 moves
+        move_summaries = self._build_move_summaries(2)
+
+        recent = {
+            "last_actions": list(self.action_log[-8:]),
+            "last_events": list(self.event_log[-6:]),
+            "last_moves_detailed": move_summaries,  # NEW: Detailed move history
+            "recent_reflections": list(self.reflection_history[-3:]),  # NEW: Recent reflections
+        }
+
+        # Reflection system status
+        reflection_status = {
+            "enabled": bool(self.reflection_enabled),
+            "can_reflect_now": bool(self.reflection_enabled and not self.last_was_reflection),
+            "must_act_next": bool(self.last_was_reflection),  # If last was reflection, must act now
+            "recent_reflections": list(self.reflection_history[-2:]),
+        }
+
+        bundle = {
+            "step": int(a.steps),
+            "TOOLBOX": toolbox,
+            "agent": agent_state,
+            "mission": mission,
+            "kg_knowledge": kg_summary,
+            "recent_history": recent,
+            "reflection": reflection_status,  # NEW: Reflection system state
+            "current_llm_lens": self.llm_current_lens or "auto",
+            "current_llm_target": self.llm_target_cell or None,
+        }
+        return bundle
+
+    def _ollama_generate(self, prompt: str, temperature: float = 0.2) -> str:
+        url = f"{self.ollama_host}/api/generate"
+        payload = {
+            "model": self.ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": float(temperature)},
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=450) as resp:
+                data = resp.read().decode("utf-8")
+            j = json.loads(data)
+            return (j.get("response") or "").strip()
+        except Exception as e:
+            self.llm_last_error = f"ollama_error: {e}"
+            return ""
+
+    def _extract_balanced_json(self, s: str) -> str:
+        start = s.find("{")
+        if start < 0: return ""
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "{": depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0: return s[start : i + 1]
+        return ""
+
+    def _parse_llm_toolcall(self, text: str) -> Dict[str, Any]:
+        t = text.strip()
+        narrative = ""
+        summary = ""
+        think_match = re.search(r"<think>(.*?)</think>", t, re.DOTALL)
+        if think_match:
+            narrative = think_match.group(1).strip()
+        
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```\s*$", "", t)
+
+        tool = ""
+        # Added "reflect" to the list of tools
+        for candidate in ("activate", "action", "annotate", "observe", "reflect"):
+            token = f"[[{candidate}]]"
+            if token in t:
+                tool = candidate
+                parts = t.split(token, 1)
+                preamble = parts[0].strip()
+                after = parts[1].strip()
+                if not narrative: narrative = preamble
+                js = self._extract_balanced_json(after)
+                data = {}
+                if js:
+                    try: data = json.loads(js)
+                    except Exception:
+                        try: data = ast.literal_eval(js)
+                        except Exception: data = {}
+                return {"tool": tool, "data": data, "narrative": narrative, "summary": summary}
+        return {"tool": "", "data": {}, "narrative": narrative or t}
+
+    def _apply_llm_decision(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        tool = parsed.get("tool") or ""
+        data = parsed.get("data") or {}
+        used: Dict[str, Any] = {}
+        allowed_lenses = {"auto", "explore", "to_food", "to_oil", "hunt_exit", "find_key", "to_target"}
+
+        if tool == "activate":
+            lens = str(data.get("lens", "auto")).strip()
+            if lens not in allowed_lenses:
+                self.llm_last_error = f"bad_lens: {lens}"
+            else:
+                self.llm_current_lens = lens
+                used["lens"] = lens
+                target_cell = data.get("target_cell") or data.get("target") or ""
+                if isinstance(target_cell, list) and len(target_cell) == 2:
+                    try:
+                        tx, ty = int(target_cell[0]), int(target_cell[1])
+                        target_cell = self.kg.cell_id(tx, ty)
+                    except Exception: target_cell = ""
+                if isinstance(target_cell, str):
+                    target_cell = target_cell.strip()
+                    if target_cell and not target_cell.startswith("cell:") and "," in target_cell:
+                        target_cell = "cell:" + target_cell.replace(" ", "")
+                    if target_cell and target_cell.startswith("cell:"):
+                        self.llm_target_cell = target_cell
+                        used["target_cell"] = target_cell
+
+        elif tool == "action":
+            mv = str(data.get("move", "")).strip().upper()
+            if mv in DIRS:
+                self.llm_action_override = mv
+                used["move"] = mv
+            else:
+                self.llm_last_error = f"bad_move: {mv}"
+        
+        elif tool == "annotate":
+            nid = data.get("node_id")
+            tags = data.get("tags", [])
+            note = data.get("note")
+            if nid and nid in self.kg.nodes:
+                n = self.kg.nodes[nid]
+                if tags:
+                    for tag in tags:
+                        if tag not in n.tags:
+                            n.tags.append(str(tag))
+                if note:
+                    n.attrs["ai_note"] = str(note)
+                used["annotate"] = {"id": nid, "tags": tags, "note": note}
+
+        elif tool == "observe":
+            text = str(data.get("text", "")).strip()
+            importance = data.get("importance", 0.5)
+            try: importance = float(importance)
+            except (ValueError, TypeError): importance = 0.5
+            tags = data.get("tags", [])
+            if isinstance(tags, str): tags = [t.strip() for t in tags.split(",") if t.strip()]
+            linked = data.get("linked_nodes", [])
+            if isinstance(linked, str): linked = [linked] if linked else []
+            a = self.agent
+            cur_cell = self.kg.cell_id(a.x, a.y)
+            if not linked: linked = [cur_cell]
+            if text:
+                mem = self.kg.add_memory(
+                    text=text,
+                    importance=importance,
+                    context_tags=tags if tags else [],
+                    linked_nodes=linked,
+                    step=self.agent.steps
+                )
+                used["observe"] = {"id": mem.id, "text": text, "importance": importance, "tags": tags}
+                self._log_event("observe", f"Memory: {text[:40]}...", {"id": mem.id, "importance": importance})
+            else:
+                self.llm_last_error = "observe: empty text"
+
+        elif tool == "reflect":
+            # Handle reflection - query the KG without consuming resources
+            if not self.reflection_enabled:
+                self.llm_last_error = "reflection_disabled"
+            elif self.last_was_reflection:
+                self.llm_last_error = "reflection_not_allowed: must act after reflecting"
+            else:
+                query = str(data.get("query", "")).strip()
+                query_type = str(data.get("type", "general")).strip().lower()
+                if query:
+                    result = self.reflection_query(query, query_type)
+                    used["reflect"] = {
+                        "query": query,
+                        "type": query_type,
+                        "result": result,
+                    }
+                    self.last_was_reflection = True  # Mark that we reflected
+                    self._log_event("reflect", f"Query: {query[:40]}...", {"type": query_type, "result_summary": result.get("narrative", "")})
+                    # Force immediate checkin after reflection to get action
+                    self.llm_steps_until_checkin = 0
+                else:
+                    self.llm_last_error = "reflect: empty query"
+
+        steps_to_run = data.get("steps_to_run") or data.get("next_check_in")
+        if steps_to_run is not None and self.llm_allow_choose_next:
+            try:
+                n = int(steps_to_run)
+                n = max(1, min(12, n))
+                self.llm_steps_until_checkin = n - 1
+                used["steps_to_run"] = n
+            except Exception: pass
+        return used
+
+    def llm_checkin(self, force: bool = True) -> Dict[str, Any]:
+        bundle = self._build_llm_bundle()
+        
+        # Build reflection availability message
+        can_reflect = self.reflection_enabled and not self.last_was_reflection
+        reflection_msg = ""
+        if can_reflect:
+            reflection_msg = (
+                "REFLECTION (Optional - use BEFORE acting to query KG for information):\n"
+                "  • [[reflect]] {\"query\": \"where is the key?\", \"type\": \"location\"}\n"
+                "  • [[reflect]] {\"query\": \"recent moves\", \"type\": \"history\"}\n"
+                "  • [[reflect]] {\"query\": \"path to food\", \"type\": \"path\"}\n"
+                "  • [[reflect]] {\"query\": \"am I in danger?\", \"type\": \"danger\"}\n"
+                "  Query types: location, history, path, status, danger, general\n"
+                "  NOTE: Reflection costs NO energy/oil but you can only reflect ONCE before taking an action.\n\n"
+            )
+        else:
+            reflection_msg = (
+                "REFLECTION: NOT AVAILABLE this turn (you reflected last turn, must act now).\n\n"
+            )
+        
+        prompt = (
+            "You are NOT an AI. You are the CONSCIOUS WILL of a maze-exploring agent. You are in THINKING MODE.\n"
+            "The Knowledge Graph (KG) is your MEMORY. The Maze is your REALITY.\n"
+            "You must carefully analyze the situation step-by-step before deciding.\n\n"
+            
+            "YOUR JOB: Activate a KG LENS (process) and set how many steps it should run autonomously.\n\n"
+            
+            "AVAILABLE LENSES (see TOOLBOX in bundle for status of each):\n"
+            "  • explore    - Expand the map by going to frontier cells\n"
+            "  • to_food    - Get energy (HP) from known food sources\n"
+            "  • to_oil     - Get vision from known oil sources\n"
+            "  • find_key   - Locate/reach the key (required to exit)\n"
+            "  • hunt_exit  - Go to exit (only after obtaining key)\n"
+            "  • to_target  - Go to specific cell (set target_cell parameter)\n"
+            "  • auto       - Let KG heuristics decide\n\n"
+            
+            + reflection_msg +
+            
+            "SPECIAL TOOLS:\n"
+            "  • annotate   - Tag KG nodes (danger, interest, etc.)\n"
+            "     Usage: [[annotate]] {\"node_id\": \"cell:X,Y\", \"tags\": [\"danger\"], \"note\": \"...\"}\n"
+            "  • observe    - Store a memory/observation for future retrieval (searched by importance + context relevance)\n"
+            "     Usage: [[observe]] {\"text\": \"description\", \"importance\": 0.7, \"tags\": [\"tactical\", \"danger\"]}\n\n"
+            
+            "OUTPUT FORMAT:\n"
+            "1. <think>\n"
+            "   Your inner monologue. Analyze HP, Oil, nearby Monsters, and Map geometry.\n"
+            "   Review recent_history.last_moves_detailed for what just happened.\n"
+            "   Consider turn-based combat: If adjacent to a monster, do we fight (attack) or retreat?\n"
+            "   Our vision fades as oil depletes (max 6, drops if <4). Our life is at stake.\n"
+            "   </think>\n\n"
+            
+            "2. ONE command line (after the thinking block):\n\n"
+            "   [[activate]] {\"lens\": \"LENS_NAME\", \"steps_to_run\": 4-8, \"reason\": \"...\", \"target_cell\": \"cell:X,Y\" (optional)}\n\n"
+            
+            "   OR (when you want to remember something):\n"
+            "   [[observe]] {\"text\": \"...\", \"importance\": 0.7, \"tags\": [\"...\"]}\n"
+            "   [[activate]] {\"lens\": \"LENS_NAME\", \"steps_to_run\": 4-8}\n\n"
+            
+            "   OR (COMBAT / EMERGENCY):\n"
+            "   [[action]] {\"move\": \"N|E|S|W\", \"reason\": \"Manual override for tactical move\"}\n\n"
+            
+            "   OR (if reflection available and you need information first):\n"
+            "   [[reflect]] {\"query\": \"your question\", \"type\": \"location|history|path|status|danger|general\"}\n\n"
+            
+            "GUIDANCE:\n"
+            "• IF MONSTER ADJACENT: We are in combat! Use [[action]] to Attack/Retreat, or short [[activate]] steps (1).\n"
+            "• PREFER higher steps_to_run (4-8) when situation is stable.\n"
+            "• Use [[observe]] to record important findings.\n"
+            "• Use [[reflect]] when unsure about KG state (where is key? what path to food?).\n"
+            "• Check recent_history.last_moves_detailed to understand what happened in last 2 moves.\n\n"
+            
+            "BUNDLE:\n"
+            + json.dumps(bundle, ensure_ascii=False, indent=2)
+        )
+
+        self.llm_last_error = ""
+        raw = self._ollama_generate(prompt)
+        self.llm_last_raw = raw
+        parsed = self._parse_llm_toolcall(raw)
+        if not raw: self.llm_last_error = self.llm_last_error or "empty_model_output"
+        if not parsed.get("tool"): self.llm_last_error = self.llm_last_error or "parse_error: no [[tool]] found"
+        used = self._apply_llm_decision(parsed)
+        if "steps_to_run" not in used:
+            self.llm_steps_until_checkin = max(0, int(self.llm_checkin_every) - 1)
+        trace = {
+            "step": int(self.agent.steps),
+            "bundle": bundle,
+            "prompt_preview": prompt[:1500],
+            "raw_output": raw,
+            "narrative": (parsed.get("narrative") or "").strip(),
+            "summary": str((parsed.get("data") or {}).get("summary","") or ""),
+            "parsed": parsed,
+            "used": used,
+            "steps_until_checkin": int(self.llm_steps_until_checkin),
+            "current_lens": self.llm_current_lens or "auto",
+            "target_cell": self.llm_target_cell or "",
+            "error": self.llm_last_error or "",
+        }
+        self.llm_last_trace = trace
+        self.llm_last_narrative = (trace.get("summary") or trace.get("narrative") or str((parsed.get("data") or {}).get("reason","") or "")).strip()
+        return trace
+
+    def _llm_maybe_checkin(self):
+        if not self.llm_enabled: return
+        if self.llm_steps_until_checkin > 0:
+            self.llm_steps_until_checkin -= 1
+            return
+        self.llm_checkin(force=True)
+
+    def _move_monsters(self):
+        a = self.agent
+        moved_monsters = []
+        for m in self.maze.monsters:
+            has_los = self.maze.check_los(m.x, m.y, a.x, a.y, limit=8)
+            # COMBAT: If adjacent, attack agent instead of moving
+            if abs(m.x - a.x) + abs(m.y - a.y) == 1:
+                dmg = m.damage
+                a.energy -= dmg
+                self._log_event("combat", f"{m.kind} attacks Agent!", {"dmg": dmg, "hp_left": a.energy})
+                self.llm_steps_until_checkin = 0
+                if a.energy <= 0:
+                    a.energy = 0
+                    a.mode = "exhausted"
+                continue
+            candidates = []
+            if has_los:
+                best_dist = abs(m.x - a.x) + abs(m.y - a.y)
+                for dname, (dx, dy, _, _) in DIRS.items():
+                    nx, ny = m.x + dx, m.y + dy
+                    if self.maze.can_move(m.x, m.y, dname):
+                        if any(om.x == nx and om.y == ny for om in self.maze.monsters if om is not m):
+                            continue
+                        dist = abs(nx - a.x) + abs(ny - a.y)
+                        if dist < best_dist:
+                            candidates.append((dist, dname, nx, ny))
+                candidates.sort(key=lambda x: x[0])
+            if not candidates:
+                open_dirs = []
+                for dname, (dx, dy, _, _) in DIRS.items():
+                    nx, ny = m.x + dx, m.y + dy
+                    if self.maze.can_move(m.x, m.y, dname):
+                         if not any(om.x == nx and om.y == ny for om in self.maze.monsters if om is not m):
+                             open_dirs.append((dname, nx, ny))
+                if open_dirs:
+                    dn, nx, ny = self.rng.choice(open_dirs)
+                    candidates.append((0, dn, nx, ny))
+            if candidates:
+                _, _, nx, ny = candidates[0]
+                m.x, m.y = nx, ny
+            moved_monsters.append(m)
+
+    def step(self):
+        a = self.agent
+        if a.escaped or a.mode == "exhausted": return
+        self._tick_respawns()
+
+        if a.steps > 0 and a.steps % 4 == 0:
+            a.oil = max(0, a.oil - 1)
+            if a.oil <= 3:
+                self._log_event("status", f"Oil depleting ({a.oil} left)")
+
+        old_vis_monsters = {m.id for m in self.maze.monsters if (m.x, m.y) in self.visible}
+        self._update_visibility_and_observe()
+        new_vis_monsters = {m.id for m in self.maze.monsters if (m.x, m.y) in self.visible}
+        if new_vis_monsters - old_vis_monsters:
+             self.llm_steps_until_checkin = 0
+             self._log_event("danger", "Monster spotted!")
+
+        cur_cell = self.kg.cell_id(a.x, a.y)
+        cur_node = self.kg.nodes[cur_cell]
+        if "key" in (cur_node.tags or []):
+            if not a.has_key:
+                self._log_event("mission", "Picked up key", {"pos": [int(a.x), int(a.y)]})
+            a.has_key = True
+        self._consume_if_present()
+        if a.has_key and "exit" in (cur_node.tags or []):
+            self._log_event("mission", "Escaped!", {"pos": [int(a.x), int(a.y)]})
+            a.mode = "escaped"
+            a.escaped = True
+            self._sync_agent_node()
+            return
+
+        self._llm_maybe_checkin()
+
+        if self.llm_enabled and self.llm_current_lens and self.llm_current_lens != "auto":
+            a.mode = self.llm_current_lens
+        else:
+            if a.energy <= 14: a.mode = "to_food"
+            elif a.oil <= 2: a.mode = "to_oil"
+            elif a.has_key: a.mode = "hunt_exit"
+            else: a.mode = "explore"
+
+        plan = [cur_cell]
+        if self.llm_enabled and self.llm_target_cell:
+            if self.llm_target_cell == cur_cell: self.llm_target_cell = None
+            else:
+                tp = self._bfs_path(cur_cell, {self.llm_target_cell})
+                if tp: plan = tp
+
+        if plan == [cur_cell] and a.mode == "to_food":
+            goals = self._resource_targets("food")
+            p = self._bfs_path(cur_cell, goals) if goals else None
+            if p: plan = p
+        if plan == [cur_cell] and a.mode == "to_oil":
+            goals = self._resource_targets("oil")
+            p = self._bfs_path(cur_cell, goals) if goals else None
+            if p: plan = p
+        if plan == [cur_cell] and a.mode == "hunt_exit":
+            exit_cells = {nid for nid, n in self.kg.nodes.items() if n.kind == "cell" and "exit" in (n.tags or [])}
+            p = self._bfs_path(cur_cell, exit_cells) if exit_cells else None
+            if p: plan = p
+        if plan == [cur_cell] and a.mode == "find_key":
+            if not a.has_key:
+                key_cells = {nid for nid, n in self.kg.nodes.items() if n.kind == "cell" and "key" in (n.tags or [])}
+                if key_cells:
+                    p = self._bfs_path(cur_cell, key_cells)
+                    if p: plan = p
+        if plan == [cur_cell]:
+            frontiers = {nid for nid, n in self.kg.nodes.items() if n.kind == "cell" and n.frontier}
+            p = self._bfs_path(cur_cell, frontiers) if frontiers else None
+            if p: plan = p
+
+        a.last_plan = plan
+        action = None
+        if self.llm_enabled and self.llm_action_override:
+            proposed = self.llm_action_override
+            self.llm_action_override = None
+            if self.maze.can_move(a.x, a.y, proposed): action = proposed
+            else: self._log_event("llm", "LLM proposed illegal move", {"move": proposed})
+        if action is None:
+            action = self._choose_action_from_plan(plan)
+            avoid = OPP_DIR[a.last_action] if a.last_action else None
+            if action is None: action = self._step_into_unknown(avoid)
+
+        if action is not None and self.maze.can_move(a.x, a.y, action):
+            dx, dy, _, _ = DIRS[action]
+            nx, ny = a.x + dx, a.y + dy
+            
+            # Track move details for history
+            from_pos = (a.x, a.y)
+            move_events = []
+            hp_before = a.energy
+            oil_before = a.oil
+            
+            monster_target = None
+            for m in self.maze.monsters:
+                if m.x == nx and m.y == ny:
+                    monster_target = m
+                    break
+            if monster_target:
+                # 0 weapon = 1 dmg base
+                agent_dmg = 1 + a.weapon_power
+                monster_target.hp -= agent_dmg
+                self._log_event("combat", f"Hit {monster_target.kind} (-{agent_dmg} HP)", {"mob_hp": monster_target.hp})
+                move_events.append(f"attacked {monster_target.kind}")
+                self.llm_steps_until_checkin = 0
+                if monster_target.hp <= 0:
+                    self.maze.monsters.remove(monster_target)
+                    self._log_event("combat", f"Slayed {monster_target.kind}!", {"xp": "win"})
+                    move_events.append(f"slayed {monster_target.kind}")
+                    # Monster dead - agent will move into that space (continue to movement code below)
+                else:
+                    # Monster survives - agent STAYS IN PLACE (bump attack)
+                    # Record correctly: agent did not move, just attacked
+                    self._record_move(f"attack_{action}", from_pos, from_pos, move_events, 0, 0)
+                    self._sync_agent_node()
+                    self._move_monsters()
+                    # Reset reflection flag - we took an action
+                    self.last_was_reflection = False
+                    return
+            
+            cost = 1
+            tile_item = self.maze.items.get((nx, ny))
+            if tile_item and tile_item.get("type") == "rubble":
+                cost += int(tile_item.get("cost", 1))
+                move_events.append("crossed rubble")
+            a.energy -= cost
+            if a.energy <= 0:
+                a.energy = 0
+                a.mode = "exhausted"
+                move_events.append("exhausted")
+                self._record_move(action, from_pos, (nx, ny), move_events, -(hp_before), 0)
+                self._sync_agent_node()
+                # Reset reflection flag
+                self.last_was_reflection = False
+                return
+
+            src = self.kg.cell_id(a.x, a.y)
+            dst = self.kg.cell_id(nx, ny)
+            step = a.steps
+            self.kg.ensure_node(dst, "cell", nx, ny, step)
+            self.kg.bump_edge(src, dst, "move", action, "traversed", step)
+            self.kg.bump_edge(dst, src, "move", OPP_DIR[action], "traversed", step)
+            self.kg.touch_node(src, step, used=True)
+            self.kg.touch_node(dst, step, used=True)
+            a.x, a.y = nx, ny
+            a.last_action = action
+            a.steps += 1
+            
+            # Check what we found at new position
+            new_cell_item = self.maze.items.get((nx, ny))
+            if new_cell_item:
+                item_type = new_cell_item.get("type", "")
+                if item_type == "food":
+                    move_events.append("found food")
+                elif item_type == "oil":
+                    move_events.append("found oil")
+                elif item_type == "weapon":
+                    move_events.append(f"found {new_cell_item.get('name', 'weapon')}")
+            
+            # Check for key/exit
+            new_node = self.kg.nodes.get(dst)
+            if new_node:
+                if "key" in (new_node.tags or []):
+                    move_events.append("reached key!")
+                if "exit" in (new_node.tags or []):
+                    move_events.append("reached exit!")
+            
+            # Record the move with details
+            hp_change = a.energy - hp_before
+            oil_change = a.oil - oil_before
+            self._record_move(action, from_pos, (nx, ny), move_events, hp_change, oil_change)
+        
+        # Reset reflection flag - we took an action (or tried to)
+        self.last_was_reflection = False
+        
+        self._move_monsters()
+        
+        self.path_log.append((int(a.x), int(a.y)))
+        self.action_log.append(str(action))
+        if len(self.path_log) > 120: self.path_log = self.path_log[-120:]
+        if len(self.action_log) > 120: self.action_log = self.action_log[-120:]
+        self._update_visibility_and_observe()
+        self._rebuild_regions()
+        self.kg.prune(a.steps, node_ttl=self.node_ttl, edge_ttl=self.edge_ttl)
+        self._sync_agent_node()
+
+    def state(self):
+        try:
+            a = self.agent
+            
+            # Explicit try/catch for monster processing
+            try:
+                all_monsters = []
+                vis_set = self.visible
+                for m in self.maze.monsters:
+                    is_vis = (m.x, m.y) in vis_set
+                    all_monsters.append({
+                        "id": str(m.id), 
+                        "x": int(m.x), 
+                        "y": int(m.y), 
+                        "kind": str(m.kind), 
+                        "level": int(m.level),
+                        "hp": int(m.hp),
+                        "max_hp": int(m.max_hp),
+                        "visible": bool(is_vis)
+                    })
+            except Exception as me:
+                print(f"Monster Error: {me}")
+                all_monsters = []
+
+            # Explicit try/catch for item processing
+            try:
+                all_items = []
+                for pos, item in self.maze.items.items():
+                     is_vis = pos in vis_set
+                     # Ensure item is a clean dict
+                     clean_item = {str(k): v for k, v in item.items()}
+                     all_items.append({
+                         "x": int(pos[0]),
+                         "y": int(pos[1]),
+                         "type": str(item.get("type", "unknown")),
+                         "visible": bool(is_vis),
+                         "meta": clean_item
+                     })
+            except Exception as ie:
+                print(f"Item Error: {ie}")
+                all_items = []
+
+            return {
+                "config": self.config(),
+                "maze": {
+                    "w": int(self.maze.w),
+                    "h": int(self.maze.h),
+                    "walls": self.maze.walls,
+                    "start": list(self.maze.start),
+                    "key": list(self.maze.key),
+                    "exit": list(self.maze.exit),
+                    "monsters": all_monsters, 
+                },
+                "ground_truth": {
+                     "items": all_items,
+                     "monsters": all_monsters
+                },
+                "agent": {
+                    "x": int(a.x),
+                    "y": int(a.y),
+                    "has_key": bool(a.has_key),
+                    "steps": int(a.steps),
+                    "mode": str(a.mode),
+                    "plan": a.last_plan,
+                    "escaped": bool(a.escaped),
+                    "energy": int(a.energy),
+                    "oil": int(a.oil),
+                    "weapon_power": int(a.weapon_power),
+                },
+                "llm": self.llm_state(),
+                "kg": self.kg.to_json(step=a.steps),
+                "visible": [list(p) for p in sorted(list(self.visible))],
+            }
+        except Exception as e:
+            print(f"ERROR IN STATE: {e}")
+            traceback.print_exc()
+            return {"error": str(e), "trace": traceback.format_exc()}
+
+
+# ----------------------------
+# FastAPI app
+# ----------------------------
+app = FastAPI()
+game = Game(w=18, h=12)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    with open("static/index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/state")
+def get_state():
+    try:
+        return JSONResponse(game.state())
+    except Exception as e:
+        print(f"ROUTE ERROR: {e}")
+        traceback.print_exc()
+        return JSONResponse({"error": "Route Error", "details": str(e)}, status_code=500)
+
+
+@app.post("/step")
+def do_step():
+    game.step()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/reset")
+def do_reset():
+    game.reset_same_maze()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/new_maze")
+def do_new_maze():
+    game.new_maze()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/config")
+def get_config():
+    return JSONResponse(game.config())
+
+
+@app.post("/config")
+def set_config(payload: Dict[str, Any] = Body(default={})):
+    if "start_energy" in payload:
+        v = int(payload["start_energy"])
+        game.start_energy = max(10, min(200, v))
+    if "start_oil" in payload:
+        v = int(payload["start_oil"])
+        game.start_oil = max(1, min(20, v))
+    if "node_ttl" in payload:
+        v = int(payload["node_ttl"])
+        game.node_ttl = max(60, min(5000, v))
+    if "edge_ttl" in payload:
+        v = int(payload["edge_ttl"])
+        game.edge_ttl = max(60, min(5000, v))
+    if "monster_hp_scale" in payload:
+        v = float(payload["monster_hp_scale"])
+        game.monster_hp_scale = max(0.1, min(5.0, v))
+    if "monster_dmg_scale" in payload:
+        v = float(payload["monster_dmg_scale"])
+        game.monster_dmg_scale = max(0.1, min(5.0, v))
+    return JSONResponse({"ok": True, "config": game.config()})
+
+
+@app.get("/llm_config")
+def get_llm_config():
+    return JSONResponse(game.llm_state())
+
+
+@app.post("/llm_config")
+def set_llm_config(payload: Dict[str, Any] = Body(default={})):
+    if "enabled" in payload:
+        game.llm_enabled = bool(payload["enabled"])
+    if "checkin_every" in payload:
+        try:
+            game.llm_checkin_every = max(1, min(8, int(payload["checkin_every"])))
+        except Exception:
+            pass
+    if "allow_model_choose_next" in payload:
+        game.llm_allow_choose_next = bool(payload["allow_model_choose_next"])
+    if "model" in payload and payload["model"]:
+        game.ollama_model = str(payload["model"]).strip()
+    if "host" in payload and payload["host"]:
+        game.ollama_host = str(payload["host"]).strip().rstrip("/")
+    if payload.get("reset_countdown"):
+        game.llm_steps_until_checkin = 0
+    return JSONResponse({"ok": True, "llm": game.llm_state()})
+
+
+@app.get("/llm_trace")
+def get_llm_trace():
+    return JSONResponse(game.llm_last_trace or {})
+
+
+@app.post("/reflect")
+def do_reflect(payload: Dict[str, Any] = Body(default={})):
+    """
+    Manual reflection endpoint - allows querying the KG without consuming resources.
+    Only available if reflection is enabled and last action wasn't a reflection.
+    """
+    if not game.reflection_enabled:
+        return JSONResponse({"ok": False, "error": "reflection_disabled"}, status_code=400)
+    
+    if game.last_was_reflection:
+        return JSONResponse({"ok": False, "error": "must_act_before_reflecting_again"}, status_code=400)
+    
+    query = str(payload.get("query", "")).strip()
+    query_type = str(payload.get("type", "general")).strip().lower()
+    
+    if not query:
+        return JSONResponse({"ok": False, "error": "query_required"}, status_code=400)
+    
+    result = game.reflection_query(query, query_type)
+    game.last_was_reflection = True  # Mark that reflection was used
+    
+    return JSONResponse({
+        "ok": True,
+        "reflection": result,
+        "must_act_next": True,
+    })
+
+
+@app.get("/reflection_status")
+def get_reflection_status():
+    """Get current reflection system status."""
+    return JSONResponse({
+        "enabled": bool(game.reflection_enabled),
+        "can_reflect": bool(game.reflection_enabled and not game.last_was_reflection),
+        "last_was_reflection": bool(game.last_was_reflection),
+        "recent_reflections": list(game.reflection_history[-5:]),
+    })
+
+
+@app.post("/llm_checkin")
+def do_llm_checkin():
+    game._update_visibility_and_observe()
+    trace = game.llm_checkin(force=True)
+    return JSONResponse(trace)
+
+
+@app.post("/llm_step")
+def do_llm_step(payload: Dict[str, Any] = Body(default={})):
+    if payload.get("force_checkin"):
+        game.llm_steps_until_checkin = 0
+    game.step()
+    return JSONResponse(
+        {
+            "ok": True,
+            "step_after": int(game.agent.steps),
+            "llm": game.llm_state(),
+            "trace": game.llm_last_trace or {},
+        }
+    )
+
+
+@app.get("/memories")
+def get_memories(q: str = "", min_importance: float = 0.0, limit: int = 20):
+    results = []
+    q_lower = (q or "").strip().lower()
+    for m in game.kg.memories.values():
+        if m.importance < min_importance: continue
+        if q_lower:
+            text_match = q_lower in m.text.lower()
+            tag_match = any(q_lower in t.lower() for t in m.context_tags)
+            if not (text_match or tag_match): continue
+        results.append({
+            "id": m.id,
+            "text": m.text,
+            "importance": m.importance,
+            "tags": m.context_tags,
+            "linked_nodes": m.linked_nodes,
+            "step_created": m.step_created,
+            "step_last_accessed": m.step_last_accessed,
+            "age": game.agent.steps - m.step_created,
+        })
+    results.sort(key=lambda x: x["importance"], reverse=True)
+    return JSONResponse({"memories": results[:limit], "total": len(game.kg.memories)})
+
+
+@app.post("/memories")
+def add_memory(payload: Dict[str, Any] = Body(default={})):
+    text = str(payload.get("text", "")).strip()
+    importance = float(payload.get("importance", 0.5))
+    tags = payload.get("tags", [])
+    linked = payload.get("linked_nodes", [])
+    if not text:
+        return JSONResponse({"ok": False, "error": "text required"}, status_code=400)
+    if not linked:
+        linked = [game.kg.cell_id(game.agent.x, game.agent.y)]
+    mem = game.kg.add_memory(
+        text=text,
+        importance=importance,
+        context_tags=tags if isinstance(tags, list) else [],
+        linked_nodes=linked if isinstance(linked, list) else [],
+        step=game.agent.steps
+    )
+    return JSONResponse({
+        "ok": True,
+        "memory": {
+            "id": mem.id,
+            "text": mem.text,
+            "importance": mem.importance,
+            "tags": mem.context_tags,
+        }
+    })
+
+
+@app.get("/memories/relevant")
+def get_relevant_memories(top_k: int = 5, min_importance: float = 0.2):
+    current_context = game._build_current_context_tags()
+    relevant = game.kg.search_memories(
+        current_context_tags=current_context,
+        top_k=top_k,
+        min_importance=min_importance,
+        step=game.agent.steps
+    )
+    results = []
+    for mem, score in relevant:
+        results.append({
+            "id": mem.id,
+            "text": mem.text,
+            "importance": mem.importance,
+            "relevance_score": round(score, 3),
+            "tags": mem.context_tags,
+            "age": game.agent.steps - mem.step_created,
+        })
+    return JSONResponse({
+        "memories": results,
+        "current_context": current_context,
+        "total_memories": len(game.kg.memories)
+    })
+
+
+@app.get("/query")
+def query_kg(q: str = "", limit: int = 50):
+    q = (q or "").strip().lower()
+    if not q: return JSONResponse({"q": q, "nodes": [], "edges": [], "memories": []})
+    nodes = []
+    for n in game.kg.nodes.values():
+        blob = " ".join([n.id, n.kind, " ".join(n.tags or []), " ".join([f"{k}:{v}" for k, v in (n.attrs or {}).items()])]).lower()
+        if q in blob: nodes.append({"id": n.id, "kind": n.kind, "tags": n.tags, "attrs": n.attrs})
+    edges = []
+    for e in game.kg.edges.values():
+        blob = " ".join([e.source, e.target, e.rel, str(e.action or ""), e.kind]).lower()
+        if q in blob: edges.append({"source": e.source, "target": e.target, "rel": e.rel, "action": e.action, "kind": e.kind, "confidence": e.confidence, "last_touch_step": e.last_touch_step})
+    memories = []
+    for m in game.kg.memories.values():
+        blob = " ".join([m.id, m.text] + (m.context_tags or [])).lower()
+        if q in blob: memories.append({"id": m.id, "text": m.text, "importance": m.importance, "tags": m.context_tags})
+    return JSONResponse({"q": q, "nodes": nodes[:limit], "edges": edges[:limit], "memories": memories[:limit]})
+
+
+#=====================================================================
+# 📜 FILE: static/app.js (1120 lines)
+#=====================================================================
+
+//=====================================================================
+// 📜 FILE: static/app.js (1125 lines)
+//=====================================================================
+
+let running = false;
+let timer = null;
+let lastState = null;
+let consecutiveNetworkErrors = 0; // New counter for auto-pause
+
+let highlightNodes = new Set();
+let highlightEdges = new Set();
+let d3Nodes = [];
+
+// Maze
+const canvas = document.getElementById("mazeCanvas");
+const ctx = canvas.getContext("2d");
+
+// KG SVG + zoom
+const svg = d3.select("#graphSvg");
+const svgW = +svg.attr("width");
+const svgH = +svg.attr("height");
+const zoomLayer = svg.append("g").attr("class", "zoomLayer");
+
+const zoom = d3.zoom()
+  .scaleExtent([0.1, 6])
+  .on("zoom", (event) => {
+    zoomLayer.attr("transform", event.transform);
+  });
+
+svg.call(zoom);
+
+// UI elements
+const btnStep = document.getElementById("btnStep");
+const btnRun = document.getElementById("btnRun");
+const btnReset = document.getElementById("btnReset");
+const btnNew = document.getElementById("btnNew");
+
+const chkRevealGeometry = document.getElementById("chkRevealGeometry");
+const chkGodMode = document.getElementById("chkGodMode"); // NEW
+const chkMazeItems = document.getElementById("chkMazeItems");
+const chkMazeGoals = document.getElementById("chkMazeGoals");
+
+const speedSlider = document.getElementById("speed");
+
+const inpEnergy = document.getElementById("inpEnergy");
+const inpOil = document.getElementById("inpOil");
+const inpNodeTTL = document.getElementById("inpNodeTTL");
+const inpEdgeTTL = document.getElementById("inpEdgeTTL");
+
+const inpMobHP = document.getElementById("inpMobHP");
+const inpMobDmg = document.getElementById("inpMobDmg");
+
+const btnApplyConfig = document.getElementById("btnApplyConfig");
+
+const btnFit = document.getElementById("btnFit");
+const btnRecenter = document.getElementById("btnRecenter");
+const btnZoomDense = document.getElementById("btnZoomDense");
+const chkShowObjects = document.getElementById("chkShowObjects");
+const chkShowRegions = document.getElementById("chkShowRegions");
+const chkShowMemories = document.getElementById("chkShowMemories");
+const chkFade = document.getElementById("chkFade");
+
+const info = document.getElementById("info");
+
+const chkLLMEnabled = document.getElementById("chkLLMEnabled");
+const inpLLMCheckinEvery = document.getElementById("llmCheckinEvery");
+const chkLLMAllowChoose = document.getElementById("chkLLMAllowChoose");
+const btnLLMCheckin = document.getElementById("btnLLMCheckin");
+
+const inpLLMModel = document.getElementById("llmModel");
+const inpLLMHost = document.getElementById("llmHost");
+
+const llmMeta = document.getElementById("llmMeta");
+const llmNarrative = document.getElementById("llmNarrative");
+const llmTrace = document.getElementById("llmTrace");
+const llmBundle = document.getElementById("llmBundle");
+const llmRaw = document.getElementById("llmRaw");
+
+
+const qBox = document.getElementById("qBox");
+const btnQuery = document.getElementById("btnQuery");
+const btnClear = document.getElementById("btnClear");
+const qResults = document.getElementById("qResults");
+
+btnStep.onclick = async () => { 
+  await stepOnce(); 
+  await loadLLMConfig(); 
+  await refresh(); 
+  await refreshLLMTrace();
+};
+
+btnReset.onclick = async () => {
+  await post("/reset");
+  clearQuery();
+  await refresh();
+  await refreshLLMTrace();
+};
+
+btnNew.onclick = async () => {
+  await post("/new_maze");
+  clearQuery();
+  await refresh();
+  await refreshLLMTrace();
+};
+
+btnRun.onclick = () => {
+  running = !running;
+  btnRun.textContent = running ? "Pause" : "Run";
+  consecutiveNetworkErrors = 0; // Reset error counter on manual toggle
+  if (running) loop();
+  else stopLoop();
+};
+
+speedSlider.oninput = () => {
+  if (running) { stopLoop(); loop(); }
+};
+
+btnApplyConfig.onclick = async () => {
+  const e = parseInt(inpEnergy.value || "80", 10);
+  const o = parseInt(inpOil.value || "6", 10);
+  const nt = parseInt(inpNodeTTL.value || "260", 10);
+  const et = parseInt(inpEdgeTTL.value || "320", 10);
+  
+  const mhp = parseFloat(inpMobHP ? inpMobHP.value : "1.0");
+  const mdmg = parseFloat(inpMobDmg ? inpMobDmg.value : "1.0");
+
+  await fetch("/config", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      start_energy: e,
+      start_oil: o,
+      node_ttl: nt,
+      edge_ttl: et,
+      monster_hp_scale: mhp,
+      monster_dmg_scale: mdmg
+    })
+  });
+  await refresh();
+};
+
+
+async function loadLLMConfig(){
+  try{
+    const res = await fetch("/llm_config");
+    const cfg = await res.json();
+    chkLLMEnabled.checked = !!cfg.enabled;
+    inpLLMCheckinEvery.value = String(cfg.checkin_every ?? 1);
+    chkLLMAllowChoose.checked = !!cfg.allow_model_choose_next;
+    if (inpLLMModel && cfg.model) inpLLMModel.value = String(cfg.model);
+    if (inpLLMHost && cfg.host) inpLLMHost.value = String(cfg.host);
+  } catch(e){
+    // ignore
+  }
+}
+
+async function pushLLMConfig(extra = {}){
+  const payload = {
+    enabled: chkLLMEnabled.checked,
+    checkin_every: parseInt(inpLLMCheckinEvery.value || "1", 10),
+    allow_model_choose_next: chkLLMAllowChoose.checked,
+    reset_countdown: true,
+    model: (inpLLMModel ? (inpLLMModel.value || "").trim() : undefined),
+    host: (inpLLMHost ? (inpLLMHost.value || "").trim() : undefined),
+    ...extra
+  };
+  await postJSON("/llm_config", payload);
+}
+
+chkLLMEnabled.onchange = async () => {
+  await pushLLMConfig();
+  await refresh();
+  await refreshLLMTrace();
+};
+
+inpLLMCheckinEvery.onchange = async () => {
+  await pushLLMConfig();
+  await refresh();
+  await refreshLLMTrace();
+};
+
+chkLLMAllowChoose.onchange = async () => {
+  await pushLLMConfig();
+  await refresh();
+  await refreshLLMTrace();
+};
+
+if (inpLLMModel){
+  inpLLMModel.onchange = async () => {
+    await pushLLMConfig();
+    await refresh();
+    await refreshLLMTrace();
+  };
+}
+if (inpLLMHost){
+  inpLLMHost.onchange = async () => {
+    await pushLLMConfig();
+    await refresh();
+    await refreshLLMTrace();
+  };
+}
+
+btnLLMCheckin.onclick = async () => {
+  await post("/llm_checkin");
+  await refresh();
+  await refreshLLMTrace();
+};
+
+btnQuery.onclick = async () => { await runQuery(); };
+btnClear.onclick = () => { clearQuery(); refresh(); };
+
+qBox.addEventListener("keydown", async (e) => {
+  if (e.key === "Enter") await runQuery();
+});
+
+btnFit.onclick = () => { fitGraphToView(); };
+btnRecenter.onclick = () => {
+  svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity);
+};
+
+btnZoomDense.onclick = () => { zoomToDensest(); };
+
+chkShowObjects.onchange = () => refresh();
+chkShowRegions.onchange = () => refresh();
+if (chkShowMemories) chkShowMemories.onchange = () => refresh();
+chkFade.onchange = () => refresh();
+chkMazeItems.onchange = () => refresh();
+chkMazeGoals.onchange = () => refresh();
+chkRevealGeometry.onchange = () => refresh();
+chkGodMode.onchange = () => refresh(); // NEW
+
+function stopLoop(){
+  if (timer) clearTimeout(timer);
+  timer = null;
+}
+
+// MODIFIED: Auto-pause on consecutive network errors to prevent spam
+async function loop(){
+  if (!running) return;
+
+  const stepOk = await stepOnce();
+  const refreshOk = await refresh();
+  await refreshLLMTrace(); // Optional, ignore failure
+
+  if (!stepOk || !refreshOk) {
+    consecutiveNetworkErrors++;
+    if (consecutiveNetworkErrors > 3) {
+      console.warn("Too many network errors, pausing simulation to save resources.");
+      running = false;
+      btnRun.textContent = "Run";
+      stopLoop();
+      
+      info.textContent = "⚠️ Paused: Network suspended or server disconnected.";
+      info.style.color = "orange";
+      return;
+    }
+  } else {
+    consecutiveNetworkErrors = 0; // Reset on success
+  }
+
+  if (lastState?.agent?.escaped || lastState?.agent?.mode === "exhausted") {
+    running = false;
+    btnRun.textContent = "Run";
+    stopLoop();
+    return;
+  }
+
+  if (running) {
+    const delay = parseInt(speedSlider.value, 10);
+    timer = setTimeout(loop, delay);
+  }
+}
+
+// MODIFIED: Returns boolean success/fail
+async function post(path){
+  try {
+    await fetch(path, { method:"POST" });
+    return true;
+  } catch(e) {
+    console.warn(`POST ${path} skipped (network issue)`);
+    return false;
+  }
+}
+
+// MODIFIED: Returns boolean success/fail
+async function postJSON(path, payload){
+  try {
+    await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload || {})
+    });
+    return true;
+  } catch(e) {
+    console.warn(`POST JSON ${path} skipped (network issue)`);
+    return false;
+  }
+}
+
+async function refreshLLMTrace(){
+  try{
+    const res = await fetch("/llm_trace");
+    const trace = await res.json();
+
+    const ls = lastState?.llm;
+    if (ls){
+      const errorStr = ls.last_error ? ` | ERROR: ${ls.last_error}` : "";
+      const stepsInfo = ls.steps_until_checkin > 0 
+        ? `steps_remaining=${ls.steps_until_checkin}` 
+        : "checking_in_now";
+      llmMeta.textContent =
+        `LLM ${ls.enabled ? "ON" : "OFF"} | lens=${ls.current_lens} | ${stepsInfo} | target=${ls.target_cell||"-"} | model=${ls.model}${errorStr}`;
+      
+      if (ls.last_error) {
+        llmMeta.style.color = "var(--danger)";
+      } else if (ls.enabled) {
+        llmMeta.style.color = "var(--good)";
+      } else {
+        llmMeta.style.color = "var(--muted)";
+      }
+    } else {
+      llmMeta.textContent = "LLM: (unknown)";
+      llmMeta.style.color = "var(--muted)";
+    }
+
+    if (!trace || Object.keys(trace).length === 0){
+      llmTrace.textContent = ls?.enabled ? "(waiting for first check-in...)" : "(LLM disabled)";
+      llmBundle.textContent = "";
+      llmRaw.textContent = "";
+      if (llmNarrative) llmNarrative.textContent = ls?.enabled ? "(no narrative yet)" : "";
+      return;
+    }
+
+    const decision = {
+      step: trace.step,
+      parsed: trace.parsed,
+      used: trace.used,
+      steps_to_run: trace.used?.steps_to_run || trace.steps_until_checkin + 1,
+      current_lens: trace.current_lens,
+      target_cell: trace.target_cell,
+      error: trace.error
+    };
+
+    llmTrace.textContent = JSON.stringify(decision, null, 2);
+    llmBundle.textContent = JSON.stringify(trace.bundle || {}, null, 2);
+    llmRaw.textContent = trace.raw_output || "(no output)";
+
+    if (llmNarrative){
+      const nar = (trace.summary || trace.narrative || (trace.parsed?.data?.reason) || "").trim();
+      llmNarrative.textContent = nar || "(no narrative)";
+    }
+  } catch(e){
+    llmMeta.textContent = `LLM trace error: ${e.message}`;
+    llmMeta.style.color = "var(--danger)";
+  }
+}
+
+
+async function stepOnce(){
+  return await post("/step");
+}
+
+// MODIFIED: Returns boolean success/fail
+async function refresh(){
+  try {
+    const res = await fetch("/state");
+    lastState = await res.json();
+  } catch(e) {
+    console.warn("Refresh skipped (network issue)");
+    return false;
+  }
+
+  if (lastState?.error) {
+    info.textContent = `Backend Error: ${lastState.error}`;
+    info.style.color = "red";
+    console.error(lastState.trace);
+    return true; // Technically a success in communication, even if backend errored
+  }
+
+  if (lastState?.config){
+    inpEnergy.value = lastState.config.start_energy;
+    inpOil.value = lastState.config.start_oil;
+    inpNodeTTL.value = lastState.config.node_ttl;
+    inpEdgeTTL.value = lastState.config.edge_ttl;
+    if(inpMobHP) inpMobHP.value = lastState.config.monster_hp_scale || 1.0;
+    if(inpMobDmg) inpMobDmg.value = lastState.config.monster_dmg_scale || 1.0;
+  }
+
+  drawMaze(lastState);
+  drawKG(lastState);
+  renderInfo(lastState);
+  return true;
+}
+
+function renderInfo(state){
+  const a = state.agent;
+  const nodeCount = state.kg.nodes.length;
+  const memoryCount = (state.kg.memories || []).length;
+  info.style.color = ""; // reset color
+  info.textContent =
+    `Agent @ (${a.x},${a.y}) | key=${a.has_key} | steps=${a.steps} | mode=${a.mode} | HP=${a.energy} | oil=${a.oil} | Weap=${a.weapon_power} | KG nodes=${nodeCount} | memories=${memoryCount}`;
+}
+
+function drawMaze(state){
+  // Safety check to prevent crash if state is malformed
+  if (!state || !state.maze) return;
+
+  const revealGeometry = chkRevealGeometry.checked;
+  const showItems = chkMazeItems.checked;
+  const showGoals = chkMazeGoals.checked;
+  const isGodMode = chkGodMode.checked; // NEW
+
+  const { w, h, walls } = state.maze;
+  const a = state.agent;
+
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  const pad = 20;
+  const cellSize = Math.min((canvas.width - pad*2)/w, (canvas.height - pad*2)/h);
+  const ox = pad;
+  const oy = pad;
+
+  const visible = new Set((state.visible || []).map(p => `${p[0]},${p[1]}`));
+  const cellNodes = state.kg.nodes.filter(n => n.kind === "cell");
+  const known = new Map(cellNodes.map(n => [n.id, n]));
+
+  function cellId(x,y){ return `cell:${x},${y}`; }
+  function isKnown(x,y){ return known.has(cellId(x,y)); }
+  function cellTags(x,y){
+    const n = known.get(cellId(x,y));
+    return n?.tags || [];
+  }
+
+  // Draw cells
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      const x0 = ox + x*cellSize;
+      const y0 = oy + y*cellSize;
+
+      const v = visible.has(`${x},${y}`);
+      const k = isKnown(x,y);
+
+      if (v) ctx.fillStyle = "rgba(255,255,255,0.09)";
+      else if (k) ctx.fillStyle = "rgba(255,255,255,0.05)";
+      else ctx.fillStyle = "rgba(0,0,0,0.35)";
+
+      ctx.fillRect(x0, y0, cellSize, cellSize);
+
+      // ITEM RENDERING (God Mode or Known)
+      if (isGodMode && state.ground_truth && state.ground_truth.items) {
+          // Find item at x,y
+          const gItem = state.ground_truth.items.find(i => i.x === x && i.y === y);
+          if (gItem) {
+              const t = gItem.type;
+              if (t === "rubble") {
+                  ctx.fillStyle = "rgba(170,179,195,0.25)";
+                  ctx.fillRect(x0+cellSize*0.10, y0+cellSize*0.10, cellSize*0.80, cellSize*0.80);
+              } else if (t === "oil") {
+                  ctx.fillStyle = "rgba(255,211,122,0.85)";
+                  ctx.fillRect(x0+cellSize*0.28, y0+cellSize*0.28, cellSize*0.44, cellSize*0.44);
+              } else if (t === "food") {
+                  ctx.fillStyle = "rgba(124,255,158,0.85)";
+                  ctx.fillRect(x0+cellSize*0.28, y0+cellSize*0.28, cellSize*0.44, cellSize*0.44);
+              } else if (t === "weapon") {
+                  ctx.fillStyle = "rgba(120,220,255,0.85)";
+                  ctx.fillRect(x0+cellSize*0.3, y0+cellSize*0.3, cellSize*0.4, cellSize*0.4);
+              }
+          }
+      } else if (showItems && (v || k)) {
+          // Legacy: render based on KG tags
+          const tags = cellTags(x,y);
+          if (tags.includes("rubble")){
+            ctx.fillStyle = "rgba(170,179,195,0.25)";
+            ctx.fillRect(x0+cellSize*0.10, y0+cellSize*0.10, cellSize*0.80, cellSize*0.80);
+          }
+          if (tags.includes("oil")){
+            ctx.fillStyle = "rgba(255,211,122,0.85)";
+            ctx.fillRect(x0+cellSize*0.28, y0+cellSize*0.28, cellSize*0.44, cellSize*0.44);
+          }
+          if (tags.includes("food")){
+            ctx.fillStyle = "rgba(124,255,158,0.85)";
+            ctx.fillRect(x0+cellSize*0.28, y0+cellSize*0.28, cellSize*0.44, cellSize*0.44);
+          }
+          if (tags.includes("weapon")){
+            ctx.fillStyle = "rgba(120,220,255,0.85)";
+            ctx.fillRect(x0+cellSize*0.3, y0+cellSize*0.3, cellSize*0.4, cellSize*0.4);
+          }
+      }
+
+      // GOALS
+      // Note: Ground truth for goals is just maze.key/exit logic
+      const isKey = (x===state.maze.key[0] && y===state.maze.key[1]);
+      const isExit = (x===state.maze.exit[0] && y===state.maze.exit[1]);
+
+      if (isGodMode || (showGoals && (v || cellTags(x,y).includes("key")))) {
+          if (isKey) {
+            ctx.fillStyle = "rgba(124,255,158,0.95)";
+            ctx.font = `${Math.max(12, cellSize*0.45)}px sans-serif`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText("K", x0+cellSize/2, y0+cellSize/2);
+          }
+      }
+      
+      if (isGodMode || (showGoals && (v || cellTags(x,y).includes("exit")))) {
+          if (isExit) {
+            ctx.strokeStyle = "rgba(255,107,107,0.85)";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x0+cellSize*0.18, y0+cellSize*0.18, cellSize*0.64, cellSize*0.64);
+            ctx.fillStyle = "rgba(255,107,107,0.95)";
+            ctx.font = `${Math.max(12, cellSize*0.40)}px sans-serif`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText("E", x0+cellSize/2, y0+cellSize/2);
+          }
+      }
+    }
+  }
+
+  // Draw Walls
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+  const N=1, E=2, S=4, W=8;
+
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      // If God Mode, draw all walls. Else strict visible/known rules
+      const canDraw = isGodMode || revealGeometry || visible.has(`${x},${y}`) || isKnown(x,y);
+      if (!canDraw) continue;
+
+      const x0 = ox + x*cellSize;
+      const y0 = oy + y*cellSize;
+      const cell = walls[y][x];
+
+      ctx.beginPath();
+      if (cell & N){ ctx.moveTo(x0, y0); ctx.lineTo(x0+cellSize, y0); }
+      if (cell & E){ ctx.moveTo(x0+cellSize, y0); ctx.lineTo(x0+cellSize, y0+cellSize); }
+      if (cell & S){ ctx.moveTo(x0, y0+cellSize); ctx.lineTo(x0+cellSize, y0+cellSize); }
+      if (cell & W){ ctx.moveTo(x0, y0); ctx.lineTo(x0, y0+cellSize); }
+      ctx.stroke();
+    }
+  }
+
+  // Plan
+  if (a.plan && a.plan.length > 1){
+    ctx.strokeStyle = "rgba(255,211,122,0.55)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for(let i=0;i<a.plan.length;i++){
+      const id = a.plan[i].replace("cell:", "");
+      const [px, py] = id.split(",").map(Number);
+      const cx = ox + px*cellSize + cellSize/2;
+      const cy = oy + py*cellSize + cellSize/2;
+      if (i===0) ctx.moveTo(cx,cy);
+      else ctx.lineTo(cx,cy);
+    }
+    ctx.stroke();
+  }
+  
+  // Monsters
+  // If God Mode: use state.ground_truth.monsters
+  // Else: use state.maze.monsters (which backend now populates with visible flags)
+  // Actually backend sends FULL list in ground_truth.monsters AND maze.monsters
+  // maze.monsters contains everything now, with a .visible flag?
+  // Let's use ground_truth if God Mode, else filter maze.monsters by visible.
+  
+  let monstersToDraw = [];
+  if (isGodMode && state.ground_truth && state.ground_truth.monsters) {
+      monstersToDraw = state.ground_truth.monsters;
+  } else if (state.maze.monsters) {
+      // Backend maze.monsters now includes ALL monsters with a .visible flag
+      monstersToDraw = state.maze.monsters.filter(m => m.visible);
+  }
+
+  if (monstersToDraw.length) {
+    for (const m of monstersToDraw) {
+      const mx = ox + m.x*cellSize + cellSize/2;
+      const my = oy + m.y*cellSize + cellSize/2;
+      
+      ctx.fillStyle = m.visible ? "rgba(255, 107, 107, 0.9)" : "rgba(255, 107, 107, 0.3)";
+      ctx.beginPath();
+      const r = cellSize * (0.2 + (m.level * 0.08));
+      ctx.arc(mx, my, r, 0, Math.PI*2);
+      ctx.fill();
+
+      // HP Bar
+      if (m.hp < m.max_hp) {
+          const w = cellSize * 0.8;
+          const h = 4;
+          const bx = mx - w/2;
+          const by = my - r - 8;
+          ctx.fillStyle = "rgba(0,0,0,0.5)";
+          ctx.fillRect(bx, by, w, h);
+          const pct = Math.max(0, m.hp / m.max_hp);
+          ctx.fillStyle = pct > 0.5 ? "#7CFF9E" : "#ff6b6b";
+          ctx.fillRect(bx, by, w * pct, h);
+      }
+    }
+  }
+
+  // Agent
+  const ax0 = ox + a.x*cellSize;
+  const ay0 = oy + a.y*cellSize;
+  ctx.fillStyle = "rgba(255,211,122,0.95)";
+  ctx.beginPath();
+  ctx.arc(ax0+cellSize/2, ay0+cellSize/2, cellSize*0.28, 0, Math.PI*2);
+  ctx.fill();
+}
+
+// ============================================
+// MISSING FUNCTIONS - ADDED BELOW
+// ============================================
+
+/**
+ * clearQuery - Clears the query input, highlights, and results display
+ */
+function clearQuery() {
+  if (qBox) qBox.value = "";
+  highlightNodes.clear();
+  highlightEdges.clear();
+  if (qResults) qResults.textContent = "";
+}
+
+/**
+ * runQuery - Fetches query results from /query endpoint and highlights matches
+ */
+async function runQuery() {
+  const q = (qBox?.value || "").trim();
+  if (!q) {
+    clearQuery();
+    refresh();
+    return;
+  }
+  
+  try {
+    const res = await fetch(`/query?q=${encodeURIComponent(q)}&limit=50`);
+    const data = await res.json();
+    
+    // Clear previous highlights
+    highlightNodes.clear();
+    highlightEdges.clear();
+    
+    // Add matching nodes to highlight set
+    if (data.nodes && data.nodes.length > 0) {
+      for (const n of data.nodes) {
+        highlightNodes.add(n.id);
+      }
+    }
+    
+    // Add matching edges to highlight set
+    if (data.edges && data.edges.length > 0) {
+      for (const e of data.edges) {
+        const edgeKey = `${e.source}->${e.target}:${e.rel}`;
+        highlightEdges.add(edgeKey);
+      }
+    }
+    
+    // Format results for display
+    let resultText = `Query: "${q}"\n\n`;
+    
+    if (data.nodes && data.nodes.length > 0) {
+      resultText += `NODES (${data.nodes.length}):\n`;
+      for (const n of data.nodes.slice(0, 10)) {
+        const tags = (n.tags || []).join(", ");
+        resultText += `  • ${n.id} [${n.kind}] ${tags ? `(${tags})` : ""}\n`;
+      }
+      if (data.nodes.length > 10) {
+        resultText += `  ... and ${data.nodes.length - 10} more\n`;
+      }
+      resultText += "\n";
+    }
+    
+    if (data.edges && data.edges.length > 0) {
+      resultText += `EDGES (${data.edges.length}):\n`;
+      for (const e of data.edges.slice(0, 10)) {
+        resultText += `  • ${e.source} --[${e.rel}${e.action ? `:${e.action}` : ""}]--> ${e.target}\n`;
+      }
+      if (data.edges.length > 10) {
+        resultText += `  ... and ${data.edges.length - 10} more\n`;
+      }
+      resultText += "\n";
+    }
+    
+    if (data.memories && data.memories.length > 0) {
+      resultText += `MEMORIES (${data.memories.length}):\n`;
+      for (const m of data.memories.slice(0, 10)) {
+        const tags = (m.tags || []).join(", ");
+        resultText += `  • [${m.importance.toFixed(2)}] ${m.text.substring(0, 50)}${m.text.length > 50 ? "..." : ""}\n`;
+        if (tags) resultText += `    tags: ${tags}\n`;
+      }
+      if (data.memories.length > 10) {
+        resultText += `  ... and ${data.memories.length - 10} more\n`;
+      }
+    }
+    
+    if (!data.nodes?.length && !data.edges?.length && !data.memories?.length) {
+      resultText += "(no matches found)";
+    }
+    
+    if (qResults) qResults.textContent = resultText;
+    
+    // Redraw to show highlights
+    refresh();
+    
+  } catch (e) {
+    console.error("Query error:", e);
+    if (qResults) qResults.textContent = `Error: ${e.message}`;
+  }
+}
+
+/**
+ * drawKG - Renders the Knowledge Graph using D3.js
+ * @param {Object} state - The game state containing KG nodes and edges
+ */
+function drawKG(state) {
+  if (!state || !state.kg) return;
+  
+  const showObjects = chkShowObjects?.checked ?? true;
+  const showRegions = chkShowRegions?.checked ?? false;
+  const showMemories = chkShowMemories?.checked ?? false;
+  const useFade = chkFade?.checked ?? true;
+  
+  // Filter nodes based on display options
+  let nodes = state.kg.nodes.filter(n => {
+    if (n.kind === "object" && !showObjects) return false;
+    if (n.kind === "region" && !showRegions) return false;
+    return true;
+  });
+  
+  // Add memory nodes if enabled
+  const memoryNodes = [];
+  if (showMemories && state.kg.memories && state.kg.memories.length > 0) {
+    // Position memory nodes around the center
+    const centerX = svgW / 2 / 45;
+    const centerY = svgH / 2 / 45;
+    state.kg.memories.forEach((m, i) => {
+      const angle = (i / state.kg.memories.length) * Math.PI * 2;
+      const radius = 3 + Math.random() * 2;
+      memoryNodes.push({
+        id: m.id,
+        kind: "memory",
+        x: centerX + Math.cos(angle) * radius,
+        y: centerY + Math.sin(angle) * radius,
+        tags: m.context_tags || [],
+        attrs: { text: m.text, importance: m.importance },
+        age_seen: m.age || 0,
+        age_used: m.age || 0,
+      });
+    });
+    nodes = nodes.concat(memoryNodes);
+  }
+  
+  // Filter edges - only show move edges between cells primarily
+  let edges = state.kg.edges.filter(e => {
+    // Skip edges to/from hidden node types
+    const srcNode = nodes.find(n => n.id === e.source);
+    const tgtNode = nodes.find(n => n.id === e.target);
+    if (!srcNode || !tgtNode) return false;
+    
+    // For cleaner graph, prioritize move edges
+    if (e.rel === "move") return true;
+    if (e.rel === "at" && srcNode.kind === "agent") return true;
+    if (showObjects && (e.rel === "located_at" || e.rel === "has_object")) return true;
+    if (showRegions && (e.rel === "in_region" || e.rel === "contains" || e.rel === "connects")) return true;
+    
+    return false;
+  });
+  
+  // Store for zoom functions
+  d3Nodes = nodes;
+  
+  // Clear previous content
+  zoomLayer.selectAll("*").remove();
+  
+  // Calculate CENTERED positioning based on actual node bounds
+  const mazeW = state.maze?.w || 18;
+  const mazeH = state.maze?.h || 12;
+  const scale = 45;
+  
+  // Find bounds of cell nodes to center properly
+  const cellNodes = nodes.filter(n => n.kind === "cell");
+  let minX = 0, minY = 0, maxX = mazeW, maxY = mazeH;
+  if (cellNodes.length > 0) {
+    minX = Math.min(...cellNodes.map(n => n.x));
+    maxX = Math.max(...cellNodes.map(n => n.x));
+    minY = Math.min(...cellNodes.map(n => n.y));
+    maxY = Math.max(...cellNodes.map(n => n.y));
+  }
+  
+  // Center the graph in the SVG
+  const graphW = (maxX - minX + 1) * scale;
+  const graphH = (maxY - minY + 1) * scale;
+  const offsetX = (svgW - graphW) / 2 - minX * scale;
+  const offsetY = (svgH - graphH) / 2 - minY * scale;
+  
+  // Create edge lines
+  const edgeSelection = zoomLayer.selectAll("line.edge")
+    .data(edges, d => `${d.source}-${d.target}-${d.rel}-${d.action || ""}`);
+  
+  edgeSelection.enter()
+    .append("line")
+    .attr("class", "edge")
+    .style("cursor", "pointer")
+    .on("click", function(event, d) {
+      event.stopPropagation();
+      showEdgeInfo(d);
+    })
+    .merge(edgeSelection)
+    .attr("x1", d => {
+      const n = nodes.find(n => n.id === d.source);
+      return n ? offsetX + n.x * scale : 0;
+    })
+    .attr("y1", d => {
+      const n = nodes.find(n => n.id === d.source);
+      return n ? offsetY + n.y * scale : 0;
+    })
+    .attr("x2", d => {
+      const n = nodes.find(n => n.id === d.target);
+      return n ? offsetX + n.x * scale : 0;
+    })
+    .attr("y2", d => {
+      const n = nodes.find(n => n.id === d.target);
+      return n ? offsetY + n.y * scale : 0;
+    })
+    .attr("stroke", d => {
+      const edgeKey = `${d.source}->${d.target}:${d.rel}`;
+      if (highlightEdges.has(edgeKey)) return "#ffd37a";
+      if (d.kind === "traversed") return "rgba(124, 255, 158, 0.5)";
+      return "rgba(255, 255, 255, 0.15)";
+    })
+    .attr("stroke-width", d => {
+      const edgeKey = `${d.source}->${d.target}:${d.rel}`;
+      if (highlightEdges.has(edgeKey)) return 3;
+      return d.kind === "traversed" ? 1.5 : 0.8;
+    })
+    .attr("opacity", d => {
+      if (!useFade) return 0.8;
+      const age = d.age_touch || 0;
+      return Math.max(0.2, 1 - age / 200);
+    });
+  
+  edgeSelection.exit().remove();
+  
+  // Create node circles with click handlers
+  const nodeSelection = zoomLayer.selectAll("circle.node")
+    .data(nodes, d => d.id);
+  
+  nodeSelection.enter()
+    .append("circle")
+    .attr("class", "node")
+    .style("cursor", "pointer")
+    .on("click", function(event, d) {
+      event.stopPropagation();
+      showNodeInfo(d);
+    })
+    .merge(nodeSelection)
+    .attr("cx", d => offsetX + d.x * scale)
+    .attr("cy", d => offsetY + d.y * scale)
+    .attr("r", d => {
+      if (d.kind === "agent") return 8;
+      if (d.kind === "region") return 12;
+      if (d.kind === "object") return 5;
+      if (d.kind === "monster") return 7;
+      if (d.kind === "memory") return 4;
+      if (d.frontier) return 5;
+      return 4;
+    })
+    .attr("fill", d => {
+      if (highlightNodes.has(d.id)) return "#ffd37a";
+      if (d.kind === "agent") return "#ffd37a";
+      if (d.kind === "region") return "rgba(120, 220, 255, 0.4)";
+      if (d.kind === "monster") return "#ff6b6b";
+      if (d.kind === "memory") return "#b478ff";
+      if (d.kind === "object") {
+        const tags = d.tags || [];
+        if (tags.includes("food")) return "#7CFF9E";
+        if (tags.includes("oil")) return "#ffd37a";
+        if (tags.includes("weapon")) return "#78dcff";
+        return "#aab3c3";
+      }
+      // Cell coloring
+      const tags = d.tags || [];
+      if (tags.includes("key")) return "#7CFF9E";
+      if (tags.includes("exit")) return "#ff6b6b";
+      if (d.frontier) return "rgba(120, 220, 255, 0.8)";
+      return "rgba(255, 255, 255, 0.5)";
+    })
+    .attr("stroke", d => {
+      if (highlightNodes.has(d.id)) return "#fff";
+      if (d.kind === "agent") return "#fff";
+      return "none";
+    })
+    .attr("stroke-width", d => highlightNodes.has(d.id) ? 2 : 1)
+    .attr("opacity", d => {
+      if (!useFade) return 1;
+      if (d.kind === "agent") return 1;
+      const age = Math.min(d.age_seen || 0, d.age_used || 0);
+      return Math.max(0.3, 1 - age / 150);
+    });
+  
+  nodeSelection.exit().remove();
+  
+  // Add labels for important nodes
+  const labelNodes = nodes.filter(n => 
+    n.kind === "agent" || 
+    n.kind === "region" ||
+    (n.tags || []).includes("key") || 
+    (n.tags || []).includes("exit") ||
+    highlightNodes.has(n.id)
+  );
+  
+  const labelSelection = zoomLayer.selectAll("text.label")
+    .data(labelNodes, d => d.id);
+  
+  labelSelection.enter()
+    .append("text")
+    .attr("class", "label")
+    .merge(labelSelection)
+    .attr("x", d => offsetX + d.x * scale)
+    .attr("y", d => offsetY + d.y * scale - 12)
+    .attr("text-anchor", "middle")
+    .attr("fill", "#e8edf7")
+    .attr("font-size", "10px")
+    .text(d => {
+      if (d.kind === "agent") return "Agent";
+      if (d.kind === "region") return d.tags?.[0] || "region";
+      if ((d.tags || []).includes("key")) return "KEY";
+      if ((d.tags || []).includes("exit")) return "EXIT";
+      return d.id.split(":").pop();
+    });
+  
+  labelSelection.exit().remove();
+}
+
+/**
+ * showNodeInfo - Display info panel for a clicked node
+ */
+function showNodeInfo(node) {
+  highlightNodes.clear();
+  highlightEdges.clear();
+  highlightNodes.add(node.id);
+  
+  let infoText = `NODE: ${node.id}\n`;
+  infoText += `Kind: ${node.kind}\n`;
+  infoText += `Position: (${node.x.toFixed(1)}, ${node.y.toFixed(1)})\n`;
+  
+  if (node.tags && node.tags.length > 0) {
+    infoText += `Tags: ${node.tags.join(", ")}\n`;
+  }
+  
+  if (node.visits) infoText += `Visits: ${node.visits}\n`;
+  if (node.seen) infoText += `Seen: ${node.seen} times\n`;
+  if (node.frontier) infoText += `Frontier: YES\n`;
+  
+  if (node.attrs) {
+    const attrStr = Object.entries(node.attrs)
+      .filter(([k, v]) => v !== null && v !== undefined)
+      .map(([k, v]) => `  ${k}: ${v}`)
+      .join("\n");
+    if (attrStr) infoText += `Attrs:\n${attrStr}\n`;
+  }
+  
+  if (node.kind === "memory" && node.attrs?.text) {
+    infoText += `\nMemory Text: "${node.attrs.text}"\n`;
+    infoText += `Importance: ${node.attrs.importance}\n`;
+  }
+  
+  // Find connected edges
+  if (lastState?.kg?.edges) {
+    const connected = lastState.kg.edges.filter(e => 
+      e.source === node.id || e.target === node.id
+    );
+    if (connected.length > 0) {
+      infoText += `\nConnections (${connected.length}):\n`;
+      for (const e of connected.slice(0, 8)) {
+        const other = e.source === node.id ? e.target : e.source;
+        const dir = e.source === node.id ? "->" : "<-";
+        infoText += `  ${dir} ${other} [${e.rel}${e.action ? `:${e.action}` : ""}]\n`;
+        highlightEdges.add(`${e.source}->${e.target}:${e.rel}`);
+      }
+      if (connected.length > 8) {
+        infoText += `  ... and ${connected.length - 8} more\n`;
+      }
+    }
+  }
+  
+  if (qResults) qResults.textContent = infoText;
+  
+  // Redraw to show highlighting
+  if (lastState) drawKG(lastState);
+}
+
+/**
+ * showEdgeInfo - Display info panel for a clicked edge
+ */
+function showEdgeInfo(edge) {
+  highlightNodes.clear();
+  highlightEdges.clear();
+  highlightNodes.add(edge.source);
+  highlightNodes.add(edge.target);
+  highlightEdges.add(`${edge.source}->${edge.target}:${edge.rel}`);
+  
+  let infoText = `EDGE: ${edge.source} -> ${edge.target}\n`;
+  infoText += `Relation: ${edge.rel}\n`;
+  if (edge.action) infoText += `Action: ${edge.action}\n`;
+  infoText += `Kind: ${edge.kind}\n`;
+  infoText += `Confidence: ${(edge.confidence * 100).toFixed(0)}%\n`;
+  infoText += `Last touched: step ${edge.last_touch_step}\n`;
+  if (edge.age_touch !== undefined) {
+    infoText += `Age: ${edge.age_touch} steps ago\n`;
+  }
+  
+  if (qResults) qResults.textContent = infoText;
+  
+  // Redraw to show highlighting
+  if (lastState) drawKG(lastState);
+}
+
+/**
+ * fitGraphToView - Calculates and applies a zoom transform to fit all nodes in view
+ */
+function fitGraphToView() {
+  if (!d3Nodes || d3Nodes.length === 0) return;
+  
+  const scale = 45;
+  
+  // Find actual bounds of nodes
+  const cellNodes = d3Nodes.filter(n => n.kind === "cell" || n.kind === "agent");
+  if (cellNodes.length === 0) return;
+  
+  const minX = Math.min(...cellNodes.map(n => n.x));
+  const maxX = Math.max(...cellNodes.map(n => n.x));
+  const minY = Math.min(...cellNodes.map(n => n.y));
+  const maxY = Math.max(...cellNodes.map(n => n.y));
+  
+  // Calculate graph dimensions
+  const graphW = (maxX - minX + 1) * scale;
+  const graphH = (maxY - minY + 1) * scale;
+  const offsetX = (svgW - graphW) / 2 - minX * scale;
+  const offsetY = (svgH - graphH) / 2 - minY * scale;
+  
+  // Calculate bounding box in SVG coordinates
+  const svgMinX = offsetX + minX * scale - 40;
+  const svgMinY = offsetY + minY * scale - 40;
+  const svgMaxX = offsetX + (maxX + 1) * scale + 40;
+  const svgMaxY = offsetY + (maxY + 1) * scale + 40;
+  
+  const boxW = svgMaxX - svgMinX;
+  const boxH = svgMaxY - svgMinY;
+  
+  if (boxW <= 0 || boxH <= 0) return;
+  
+  // Calculate scale to fit
+  const scaleX = svgW / boxW;
+  const scaleY = svgH / boxH;
+  const fitScale = Math.min(scaleX, scaleY, 2); // Cap at 2x zoom
+  
+  // Calculate translation to center
+  const centerX = (svgMinX + svgMaxX) / 2;
+  const centerY = (svgMinY + svgMaxY) / 2;
+  const translateX = svgW / 2 - centerX * fitScale;
+  const translateY = svgH / 2 - centerY * fitScale;
+  
+  // Apply transform with animation
+  const transform = d3.zoomIdentity
+    .translate(translateX, translateY)
+    .scale(fitScale);
+  
+  svg.transition()
+    .duration(400)
+    .call(zoom.transform, transform);
+}
+
+/**
+ * zoomToDensest - Zooms to center on the agent node at 1.5x scale
+ */
+function zoomToDensest() {
+  if (!d3Nodes || d3Nodes.length === 0) return;
+  
+  // Find the agent node
+  const agentNode = d3Nodes.find(n => n.kind === "agent");
+  if (!agentNode) {
+    // Fallback: zoom to center of all nodes
+    fitGraphToView();
+    return;
+  }
+  
+  const scale = 45;
+  const mazeW = lastState?.maze?.w || 18;
+  const mazeH = lastState?.maze?.h || 12;
+  const offsetX = svgW / 2 - mazeW * scale / 2;
+  const offsetY = svgH / 2 - mazeH * scale / 2;
+  
+  // Get agent position in SVG coordinates
+  const agentX = offsetX + agentNode.x * scale;
+  const agentY = offsetY + agentNode.y * scale;
+  
+  // Zoom scale
+  const zoomScale = 1.5;
+  
+  // Calculate translation to center agent
+  const translateX = svgW / 2 - agentX * zoomScale;
+  const translateY = svgH / 2 - agentY * zoomScale;
+  
+  const transform = d3.zoomIdentity
+    .translate(translateX, translateY)
+    .scale(zoomScale);
+  
+  svg.transition()
+    .duration(300)
+    .call(zoom.transform, transform);
+}
+
+// Initialize on load
+window.addEventListener("DOMContentLoaded", async () => {
+  console.log("MazeKG App.js v2 loaded"); // VERIFY THIS APPEARS IN CONSOLE
+  await loadLLMConfig();
+  await refresh();
+  await refreshLLMTrace();
+});
+
+
+#=====================================================================
+# 🌐 FILE: static/index.html (201 lines)
+#=====================================================================
+
+<!-- =====================================================================
+     🌐 FILE: static/index.html (196 lines)
+     ===================================================================== -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MazeKG Meta Playground</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="data:," />
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <div class="h1">MazeKG Meta Playground</div>
+      <div class="sub">KG mind: observes LoS, stores negatives, fades + prunes, meta-regions, memory system</div>
+    </div>
+
+    <div class="controls">
+      <button id="btnStep">Step</button>
+      <button id="btnRun">Run</button>
+      <button id="btnReset">Reset</button>
+      <button id="btnNew">New Maze</button>
+
+      <label class="toggle">
+        <input type="checkbox" id="chkRevealGeometry" />
+        <span>Reveal maze geometry (walls only)</span>
+      </label>
+
+      <!-- NEW: God Mode Checkbox -->
+      <label class="toggle">
+        <input type="checkbox" id="chkGodMode" />
+        <span>God Mode (See All)</span>
+      </label>
+
+      <label class="toggle">
+        <input type="checkbox" id="chkMazeItems" checked />
+        <span>Maze: show discovered items</span>
+      </label>
+
+      <label class="toggle">
+        <input type="checkbox" id="chkMazeGoals" checked />
+        <span>Maze: show discovered key/exit</span>
+      </label>
+
+      <label class="speed">
+        <span>Speed</span>
+        <input id="speed" type="range" min="50" max="800" value="160" />
+      </label>
+
+      <div class="llmControls">
+        <label class="toggle">
+          <input type="checkbox" id="chkLLMEnabled" />
+          <span>LLM lens controller</span>
+        </label>
+        <label class="small">
+          <span>Default steps</span>
+          <input id="llmCheckinEvery" type="number" min="1" max="12" value="4" />
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="chkLLMAllowChoose" checked />
+          <span>Model sets cadence</span>
+        </label>
+        <label class="small">
+          <span>Model</span>
+          <input id="llmModel" type="text" value="gpt-oss:20b" />
+        </label>
+        <label class="small">
+          <span>Host</span>
+          <input id="llmHost" type="text" value="http://127.0.0.1:11434" />
+        </label>
+        <button id="btnLLMCheckin">LLM Check-in</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="panelHeader">Maze View (agent vision comes from oil)</div>
+
+      <div class="settingsRow">
+        <div class="setting">
+          <span>Start HP</span>
+          <input id="inpEnergy" type="number" min="10" max="200" value="80" />
+        </div>
+        <div class="setting">
+          <span>Start Oil</span>
+          <input id="inpOil" type="number" min="1" max="20" value="6" />
+        </div>
+
+        <div class="setting">
+          <span>Node TTL</span>
+          <input id="inpNodeTTL" type="number" min="60" max="5000" value="260" />
+        </div>
+        <div class="setting">
+          <span>Edge TTL</span>
+          <input id="inpEdgeTTL" type="number" min="60" max="5000" value="320" />
+        </div>
+
+        <div class="setting">
+          <span>Mob HP x</span>
+          <input id="inpMobHP" type="number" min="0.1" max="5.0" step="0.1" value="1.0" />
+        </div>
+        <div class="setting">
+          <span>Mob Dmg x</span>
+          <input id="inpMobDmg" type="number" min="0.1" max="5.0" step="0.1" value="1.0" />
+        </div>
+
+        <button id="btnApplyConfig">Apply (then Reset/New)</button>
+      </div>
+
+      <canvas id="mazeCanvas" width="900" height="520"></canvas>
+      <div id="info" class="info"></div>
+
+      <div class="legend">
+        <span class="chip oil">Oil box (yellow)</span>
+        <span class="chip food">Food box (green, respawns)</span>
+        <span class="chip rubble">Rubble (gray)</span>
+        <span class="chip weapon">Weapon (blue)</span>
+        <span class="chip monster">Monster (red)</span>
+        <span class="chip agent">Agent</span>
+        <span class="chip key">Key</span>
+        <span class="chip exit">Exit</span>
+        <span class="chip memory">Memory (purple)</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHeader">Knowledge Graph (pan/zoom + fading)</div>
+
+      <div class="graphTools">
+        <button id="btnFit">Fit Graph</button>
+        <button id="btnRecenter">Recenter</button>
+        <button id="btnZoomDense">Zoom Cluster</button>
+
+        <label class="toggle">
+          <input type="checkbox" id="chkShowObjects" checked />
+          <span>Show objects</span>
+        </label>
+
+        <label class="toggle">
+          <input type="checkbox" id="chkShowRegions" checked />
+          <span>Show regions</span>
+        </label>
+
+        <label class="toggle">
+          <input type="checkbox" id="chkShowMemories" checked />
+          <span>Show memories</span>
+        </label>
+
+        <label class="toggle">
+          <input type="checkbox" id="chkFade" checked />
+          <span>Fade old</span>
+        </label>
+      </div>
+
+      <div class="queryBar">
+        <input id="qBox" placeholder="Try: ruled_out_key:true | key | exit | oil | food | rubble | monster | weapon | danger | tactical" />
+        <button id="btnQuery">Query</button>
+        <button id="btnClear">Clear</button>
+      </div>
+
+      <svg id="graphSvg" width="900" height="520"></svg>
+
+      <div class="results">
+        <div class="resultsTitle">Matches</div>
+        <div id="qResults" class="resultsBody">—</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHeader">LLM Lens Trace (Ollama)</div>
+      <div class="llmMeta" id="llmMeta">LLM: (disabled)</div>
+      <div class="llmGrid">
+        <details open>
+          <summary>Narrative summary</summary>
+          <pre id="llmNarrative" class="code"></pre>
+        </details>
+        <details>
+          <summary>Last decision (parsed)</summary>
+          <pre id="llmTrace" class="code"></pre>
+        </details>
+        <details>
+          <summary>Bundle (what the model saw)</summary>
+          <pre id="llmBundle" class="code"></pre>
+        </details>
+        <details>
+          <summary>Raw model output</summary>
+          <pre id="llmRaw" class="code"></pre>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <!-- CACHE BUSTER ADDED: ?v=robust -->
+  <script src="/static/app.js?v=robust"></script>
+</body>
+</html>
+
+
+#=====================================================================
+# 🎨 FILE: static/style.css (226 lines)
+#=====================================================================
+
+:root{
+  --bg:#0b0d12;
+  --panel:#121622;
+  --panel2:#171c2a;
+  --text:#e8edf7;
+  --muted:#aab3c3;
+  --accent:#ffd37a;
+  --good:#7CFF9E;
+  --danger:#ff6b6b;
+  --ice:#78dcff;
+  --memory:#b478ff;
+}
+
+*{ box-sizing:border-box; }
+body{
+  margin:0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+  background:var(--bg);
+  color:var(--text);
+}
+
+header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:14px 16px;
+  border-bottom:1px solid rgba(255,255,255,0.08);
+}
+
+.title .h1{ font-size:18px; font-weight:700; }
+.title .sub{ font-size:12px; color:var(--muted); margin-top:2px; }
+
+.controls{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+button{
+  background:var(--panel2);
+  color:var(--text);
+  border:1px solid rgba(255,255,255,0.10);
+  padding:8px 10px;
+  border-radius:10px;
+  cursor:pointer;
+}
+button:hover{ border-color: rgba(255,255,255,0.25); }
+
+.toggle, .speed{
+  display:flex;
+  gap:6px;
+  align-items:center;
+  font-size:12px;
+  color:var(--muted);
+}
+
+main{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:14px;
+  padding:14px;
+}
+
+.panel{
+  background:var(--panel);
+  border:1px solid rgba(255,255,255,0.08);
+  border-radius:16px;
+  padding:10px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+}
+
+.panelHeader{
+  font-size:13px;
+  color:var(--muted);
+  margin-bottom:8px;
+}
+
+.settingsRow{
+  display:flex;
+  gap:10px;
+  align-items:end;
+  margin:6px 0 10px 0;
+  flex-wrap:wrap;
+}
+.setting{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  font-size:12px;
+  color:var(--muted);
+}
+.setting input{
+  width:110px;
+  padding:7px 9px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,0.10);
+  background:rgba(0,0,0,0.25);
+  color:var(--text);
+  outline:none;
+}
+
+.graphTools{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
+  margin:6px 0 10px 0;
+}
+
+canvas, svg{
+  width:100%;
+  height:auto;
+  background: #0e111a;
+  border:1px solid rgba(255,255,255,0.06);
+  border-radius:14px;
+}
+
+.info{
+  margin-top:8px;
+  font-size:12px;
+  color:var(--muted);
+}
+
+.legend{
+  margin-top:10px;
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}
+
+.chip{
+  font-size:12px;
+  padding:4px 8px;
+  border-radius:999px;
+  border:1px solid rgba(255,255,255,0.10);
+  color:var(--muted);
+  background:rgba(255,255,255,0.04);
+}
+.chip.oil{ border-color: rgba(255,211,122,0.6); color: rgba(255,211,122,0.95); }
+.chip.food{ border-color: rgba(124,255,158,0.6); color: rgba(124,255,158,0.95); }
+.chip.rubble{ border-color: rgba(170,179,195,0.4); color: rgba(170,179,195,0.9); }
+.chip.agent{ border-color: rgba(255,211,122,0.35); color: rgba(255,211,122,0.95); }
+.chip.key{ border-color: rgba(124,255,158,0.35); color: rgba(124,255,158,0.95); }
+.chip.exit{ border-color: rgba(255,107,107,0.35); color: rgba(255,107,107,0.95); }
+.chip.monster{ border-color: rgba(255,107,107,0.6); color: rgba(255,107,107,0.95); }
+.chip.weapon{ border-color: rgba(120,220,255,0.6); color: rgba(120,220,255,0.95); }
+.chip.memory{ border-color: rgba(180,120,255,0.6); color: rgba(180,120,255,0.95); }
+
+
+.queryBar{
+  display:flex;
+  gap:8px;
+  margin:8px 0 10px 0;
+}
+.queryBar input{
+  flex:1;
+  padding:8px 10px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,0.10);
+  background:rgba(0,0,0,0.25);
+  color:var(--text);
+  outline:none;
+}
+.queryBar input:focus{
+  border-color: rgba(120,220,255,0.45);
+}
+
+.results{
+  margin-top:10px;
+  padding:10px;
+  border-radius:14px;
+  border:1px solid rgba(255,255,255,0.08);
+  background: rgba(0,0,0,0.18);
+}
+.resultsTitle{
+  font-size:12px;
+  color:var(--muted);
+  margin-bottom:6px;
+}
+.resultsBody{
+  font-size:12px;
+  color:var(--text);
+  max-height:140px;
+  overflow:auto;
+  white-space:pre-wrap;
+}
+
+.llmControls{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
+  margin-left:12px;
+}
+.llmControls .small{
+  display:flex;
+  gap:6px;
+  align-items:center;
+  font-size:12px;
+  color:var(--muted);
+}
+.llmControls input[type=number],
+.llmControls input[type=text]{
+  width:56px;
+  background:var(--panel2);
+  color:var(--text);
+  border:1px solid rgba(255,255,255,0.08);
+  border-radius:10px;
+  padding:4px 6px;
+}
+.llmMeta{
+  font-size:12px;
+  color:var(--muted);
+  margin:6px 0 10px;
+}
+.code{
+  background:var(--panel2);
+  padding:10px;
+  border-radius:12px;
+  border:1px solid rgba(255,255,255,0.08);
+  overflow:auto;
+  max-height:280px;
+  font-size:12px;
+  white-space:pre-wrap;  /* Fixed: Allows wrapping to prevent layout distortion */
+  word-wrap: break-word; /* Fixed: Ensures long words/JSON keys break */
+}
+
+
